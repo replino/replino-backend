@@ -1,7 +1,7 @@
 // server.js
 
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
 const fs = require('fs-extra');
 const cors = require('cors');
@@ -14,9 +14,11 @@ app.use(express.json());
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 fs.ensureDirSync(SESSIONS_DIR);
 
-const sessions = {}; // active socket connections
+const sessions = {};
 
 async function createOrGetSession(sessionId) {
+  if (sessions[sessionId]) return sessions[sessionId];
+
   const sessionPath = path.join(SESSIONS_DIR, sessionId);
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
   const { version } = await fetchLatestBaileysVersion();
@@ -32,11 +34,12 @@ async function createOrGetSession(sessionId) {
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect } = update;
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== 401);
+      const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
       if (shouldReconnect) {
         createOrGetSession(sessionId);
       } else {
         delete sessions[sessionId];
+        fs.removeSync(sessionPath);
       }
     }
   });
@@ -47,12 +50,7 @@ async function createOrGetSession(sessionId) {
 
 // ========== ROUTES ==========
 
-// Home route to avoid "Cannot GET /"
-app.get('/', (req, res) => {
-  res.send('✅ WhatsApp backend is running, test 1.');
-});
-
-// POST /qrcode – Get QR code for login
+// POST /qrcode
 app.post('/qrcode', async (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
@@ -64,34 +62,28 @@ app.post('/qrcode', async (req, res) => {
       return res.json({ qrCode: null, status: 'already_authenticated' });
     }
 
-    let responded = false;
-
-    const timeout = setTimeout(() => {
-      if (!responded) {
-        responded = true;
-        res.status(408).json({ error: 'QR code timeout' });
-      }
-    }, 10000); // 10 sec timeout
-
-    sock.ev.on('connection.update', async (update) => {
-      if (update.qr && !responded) {
+    sock.ev.once('connection.update', async (update) => {
+      if (update.qr) {
         const qr = await qrcode.toDataURL(update.qr);
-        clearTimeout(timeout);
-        responded = true;
         res.json({ qrCode: qr });
       }
     });
 
-  } catch (error) {
-    console.error('QR Error:', error);
-    return res.status(500).json({ error: 'Failed to generate QR' });
+    // Backup timeout in case QR never arrives
+    setTimeout(() => {
+      if (!sock.authState.creds?.registered) {
+        res.status(500).json({ error: 'Failed to generate QR' });
+      }
+    }, 10000);
+  } catch (err) {
+    console.error('QR Error:', err);
+    res.status(500).json({ error: 'Internal error generating QR' });
   }
 });
 
-// GET /send/:sessionId/:number/:message – Send WhatsApp message
-app.get('/send/:sessionId/:number/:message', async (req, res) => {
+// POST /send/:sessionId/:number/:message
+app.post('/send/:sessionId/:number/:message', async (req, res) => {
   const { sessionId, number, message } = req.params;
-
   if (!sessionId || !number || !message) {
     return res.status(400).json({ error: 'Missing parameters' });
   }
@@ -108,12 +100,53 @@ app.get('/send/:sessionId/:number/:message', async (req, res) => {
 
     return res.json({ status: 'sent' });
   } catch (err) {
-    console.error('Send Error:', err);
+    console.error(err);
     return res.status(500).json({ error: 'Failed to send message' });
   }
 });
 
-// ========== START SERVER ==========
+// GET /status/:sessionId
+app.get('/status/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  const sock = sessions[sessionId];
+  if (!sock) return res.json({ status: 'not_initialized' });
+
+  if (sock.authState.creds?.registered) {
+    return res.json({ status: 'authenticated' });
+  }
+
+  return res.json({ status: 'pending_qr' });
+});
+
+// POST /init/:sessionId
+app.post('/init/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  try {
+    await createOrGetSession(sessionId);
+    return res.json({ status: 'initialized' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to initialize session' });
+  }
+});
+
+// POST /disconnect/:sessionId
+app.post('/disconnect/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  const sock = sessions[sessionId];
+  if (!sock) return res.status(404).json({ error: 'Session not found' });
+
+  try {
+    await sock.logout();
+    delete sessions[sessionId];
+    fs.removeSync(path.join(SESSIONS_DIR, sessionId));
+    return res.json({ status: 'disconnected' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to disconnect session' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
