@@ -1,8 +1,7 @@
 // server.js
 
 const express = require('express');
-const { Boom } = require('@hapi/boom');
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, makeInMemoryStore } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
 const fs = require('fs-extra');
 const cors = require('cors');
@@ -15,7 +14,7 @@ app.use(express.json());
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 fs.ensureDirSync(SESSIONS_DIR);
 
-const sessions = {}; // active socket connections
+const sessions = {}; // Active socket connections
 
 async function createOrGetSession(sessionId) {
   const sessionPath = path.join(SESSIONS_DIR, sessionId);
@@ -29,10 +28,11 @@ async function createOrGetSession(sessionId) {
   });
 
   sock.ev.on('creds.update', saveCreds);
+
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect } = update;
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+      const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== 401;
       if (shouldReconnect) {
         createOrGetSession(sessionId);
       } else {
@@ -45,25 +45,43 @@ async function createOrGetSession(sessionId) {
   return sock;
 }
 
-// ========== ROUTES ==========
+// ====== ROUTES ======
+
+// Root route to prevent "Cannot GET /"
+app.get('/', (req, res) => {
+  res.send('✅ WhatsApp Backend is running!');
+});
 
 // POST /qrcode
 app.post('/qrcode', async (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
 
-  const sock = await createOrGetSession(sessionId);
+  try {
+    const sock = await createOrGetSession(sessionId);
 
-  if (sock.authState.creds?.registered) {
-    return res.json({ qrCode: null, status: 'already_authenticated' });
-  }
-
-  sock.ev.once('connection.update', async (update) => {
-    if (update.qr) {
-      const qr = await qrcode.toDataURL(update.qr);
-      return res.json({ qrCode: qr });
+    if (sock.authState.creds?.registered) {
+      return res.json({ qrCode: null, status: 'already_authenticated' });
     }
-  });
+
+    // Timeout after 10 seconds if no QR is received
+    const timeout = setTimeout(() => {
+      return res.status(408).json({ error: 'QR code timeout' });
+    }, 10000);
+
+    sock.ev.once('connection.update', async (update) => {
+      clearTimeout(timeout);
+      if (update.qr) {
+        const qr = await qrcode.toDataURL(update.qr);
+        return res.json({ qrCode: qr });
+      } else {
+        return res.status(202).json({ status: 'waiting_for_qr' });
+      }
+    });
+  } catch (error) {
+    console.error('QR Error:', error);
+    return res.status(500).json({ error: 'Failed to generate QR' });
+  }
 });
 
 // GET /send/:sessionId/:number/:message
@@ -74,19 +92,19 @@ app.get('/send/:sessionId/:number/:message', async (req, res) => {
     return res.status(400).json({ error: 'Missing parameters' });
   }
 
-  const sock = sessions[sessionId] || await createOrGetSession(sessionId);
-
-  if (!sock.authState.creds?.registered) {
-    return res.status(403).json({ error: 'Session not authenticated yet' });
-  }
-
-  const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`;
-
   try {
+    const sock = sessions[sessionId] || await createOrGetSession(sessionId);
+
+    if (!sock.authState.creds?.registered) {
+      return res.status(403).json({ error: 'Session not authenticated yet' });
+    }
+
+    const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`;
+
     await sock.sendMessage(jid, { text: message });
     return res.json({ status: 'sent' });
   } catch (err) {
-    console.error(err);
+    console.error('Send Error:', err);
     return res.status(500).json({ error: 'Failed to send message' });
   }
 });
