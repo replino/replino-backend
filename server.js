@@ -14,7 +14,7 @@ app.use(express.json());
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 fs.ensureDirSync(SESSIONS_DIR);
 
-const sessions = {}; // Active socket connections
+const sessions = {}; // active socket connections
 
 async function createOrGetSession(sessionId) {
   const sessionPath = path.join(SESSIONS_DIR, sessionId);
@@ -32,7 +32,7 @@ async function createOrGetSession(sessionId) {
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect } = update;
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== 401;
+      const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== 401);
       if (shouldReconnect) {
         createOrGetSession(sessionId);
       } else {
@@ -45,14 +45,14 @@ async function createOrGetSession(sessionId) {
   return sock;
 }
 
-// ====== ROUTES ======
+// ========== ROUTES ==========
 
-// Root route to prevent "Cannot GET /"
+// Home route to avoid "Cannot GET /"
 app.get('/', (req, res) => {
-  res.send('✅ WhatsApp Backend is running!');
+  res.send('✅ WhatsApp backend is running, test 1.');
 });
 
-// POST /qrcode
+// POST /qrcode – Get QR code for login
 app.post('/qrcode', async (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
@@ -73,12 +73,12 @@ app.post('/qrcode', async (req, res) => {
       }
     }, 10000); // 10 sec timeout
 
-    sock.ev.once('connection.update', async (update) => {
+    sock.ev.on('connection.update', async (update) => {
       if (update.qr && !responded) {
         const qr = await qrcode.toDataURL(update.qr);
         clearTimeout(timeout);
         responded = true;
-        return res.json({ qrCode: qr });
+        res.json({ qrCode: qr });
       }
     });
 
@@ -88,8 +88,7 @@ app.post('/qrcode', async (req, res) => {
   }
 });
 
-
-// GET /send/:sessionId/:number/:message
+// GET /send/:sessionId/:number/:message – Send WhatsApp message
 app.get('/send/:sessionId/:number/:message', async (req, res) => {
   const { sessionId, number, message } = req.params;
 
@@ -105,8 +104,8 @@ app.get('/send/:sessionId/:number/:message', async (req, res) => {
     }
 
     const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`;
-
     await sock.sendMessage(jid, { text: message });
+
     return res.json({ status: 'sent' });
   } catch (err) {
     console.error('Send Error:', err);
@@ -114,7 +113,7 @@ app.get('/send/:sessionId/:number/:message', async (req, res) => {
   }
 });
 
-// Start server
+// ========== START SERVER ==========
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
