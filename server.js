@@ -64,25 +64,30 @@ app.post('/qrcode', async (req, res) => {
       return res.json({ qrCode: null, status: 'already_authenticated' });
     }
 
-    // Timeout after 10 seconds if no QR is received
+    let responded = false;
+
     const timeout = setTimeout(() => {
-      return res.status(408).json({ error: 'QR code timeout' });
-    }, 10000);
+      if (!responded) {
+        responded = true;
+        res.status(408).json({ error: 'QR code timeout' });
+      }
+    }, 10000); // 10 sec timeout
 
     sock.ev.once('connection.update', async (update) => {
-      clearTimeout(timeout);
-      if (update.qr) {
+      if (update.qr && !responded) {
         const qr = await qrcode.toDataURL(update.qr);
+        clearTimeout(timeout);
+        responded = true;
         return res.json({ qrCode: qr });
-      } else {
-        return res.status(202).json({ status: 'waiting_for_qr' });
       }
     });
+
   } catch (error) {
     console.error('QR Error:', error);
     return res.status(500).json({ error: 'Failed to generate QR' });
   }
 });
+
 
 // GET /send/:sessionId/:number/:message
 app.get('/send/:sessionId/:number/:message', async (req, res) => {
