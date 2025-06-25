@@ -160,7 +160,7 @@ app.post('/disconnect/:sessionId', async (req, res) => {
 
 // Default route
 app.get('/', (req, res) => {
-  res.send('🚀 Replino WhatsApp Backend is running.');
+  res.send('Backend is running.');
 });
 
 const PORT = process.env.PORT || 3000;
