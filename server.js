@@ -60,36 +60,33 @@ app.post('/qrcode', async (req, res) => {
     const sock = await createOrGetSession(sessionId);
 
     if (sock.authState.creds?.registered) {
-      return res.json({ qrCode: null, status: 'already_authenticated' });
+      return res.json({ qr: null, status: 'already_authenticated' });
     }
 
-    let responded = false;
+    let sent = false;
 
-    sock.ev.on('connection.update', async (update) => {
-      if (update.qr && !responded) {
-        responded = true;
-        const qr = await qrcode.toDataURL(update.qr);
-        return res.json({ qrCode: qr });
+    const qrHandler = async (update) => {
+      if (update.qr && !sent) {
+        sent = true;
+        res.json({ qr: update.qr }); // ✅ Just send the raw QR string
+        clearTimeout(timeout);
       }
+    };
 
-      if (update.connection === 'open' && !responded) {
-        responded = true;
-        return res.json({ qrCode: null, status: 'authenticated' });
-      }
-    });
+    sock.ev.on('connection.update', qrHandler);
 
-    // Fallback in case QR never arrives
-    setTimeout(() => {
-      if (!responded) {
-        responded = true;
-        return res.status(504).json({ error: 'QR code timeout' });
+    const timeout = setTimeout(() => {
+      if (!sent) {
+        sent = true;
+        res.status(500).json({ error: 'QR code timeout' });
       }
-    }, 15000);
+    }, 10000);
   } catch (err) {
     console.error('QR Error:', err);
-    return res.status(500).json({ error: 'Internal error generating QR' });
+    res.status(500).json({ error: 'Internal error generating QR' });
   }
 });
+
 
 
 // POST /send/:sessionId/:number/:message
