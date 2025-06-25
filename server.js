@@ -51,6 +51,7 @@ async function createOrGetSession(sessionId) {
 // ========== ROUTES ==========
 
 // POST /qrcode
+// POST /qrcode
 app.post('/qrcode', async (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
@@ -62,24 +63,34 @@ app.post('/qrcode', async (req, res) => {
       return res.json({ qrCode: null, status: 'already_authenticated' });
     }
 
-    sock.ev.once('connection.update', async (update) => {
-      if (update.qr) {
+    let responded = false;
+
+    sock.ev.on('connection.update', async (update) => {
+      if (update.qr && !responded) {
+        responded = true;
         const qr = await qrcode.toDataURL(update.qr);
-        res.json({ qrCode: qr });
+        return res.json({ qrCode: qr });
+      }
+
+      if (update.connection === 'open' && !responded) {
+        responded = true;
+        return res.json({ qrCode: null, status: 'authenticated' });
       }
     });
 
-    // Backup timeout in case QR never arrives
+    // Fallback in case QR never arrives
     setTimeout(() => {
-      if (!sock.authState.creds?.registered) {
-        res.status(500).json({ error: 'Failed to generate QR' });
+      if (!responded) {
+        responded = true;
+        return res.status(504).json({ error: 'QR code timeout' });
       }
-    }, 10000);
+    }, 15000);
   } catch (err) {
     console.error('QR Error:', err);
-    res.status(500).json({ error: 'Internal error generating QR' });
+    return res.status(500).json({ error: 'Internal error generating QR' });
   }
 });
+
 
 // POST /send/:sessionId/:number/:message
 app.post('/send/:sessionId/:number/:message', async (req, res) => {
@@ -145,6 +156,11 @@ app.post('/disconnect/:sessionId', async (req, res) => {
     console.error(err);
     return res.status(500).json({ error: 'Failed to disconnect session' });
   }
+});
+
+// Default route
+app.get('/', (req, res) => {
+  res.send('🚀 Replino WhatsApp Backend is running.');
 });
 
 const PORT = process.env.PORT || 3000;
