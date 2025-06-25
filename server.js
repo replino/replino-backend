@@ -2,7 +2,6 @@
 
 const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode');
 const fs = require('fs-extra');
 const cors = require('cors');
 const path = require('path');
@@ -51,7 +50,6 @@ async function createOrGetSession(sessionId) {
 // ========== ROUTES ==========
 
 // POST /qrcode
-// POST /qrcode
 app.post('/qrcode', async (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
@@ -68,7 +66,14 @@ app.post('/qrcode', async (req, res) => {
     const qrHandler = async (update) => {
       if (update.qr && !sent) {
         sent = true;
-        res.json({ qr: update.qr }); // ✅ Just send the raw QR string
+        res.json({ qr: update.qr, status: 'pending_qr' });
+        clearTimeout(timeout);
+      }
+      if (update.connection === 'open') {
+        if (!sent) {
+          sent = true;
+          res.json({ qr: null, status: 'connected' });
+        }
         clearTimeout(timeout);
       }
     };
@@ -86,8 +91,6 @@ app.post('/qrcode', async (req, res) => {
     res.status(500).json({ error: 'Internal error generating QR' });
   }
 });
-
-
 
 // POST /send/:sessionId/:number/:message
 app.post('/send/:sessionId/:number/:message', async (req, res) => {
