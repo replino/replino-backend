@@ -58,45 +58,39 @@ app.post('/qrcode', async (req, res) => {
     const sock = await createOrGetSession(sessionId);
 
     if (sock.authState.creds?.registered) {
-      return res.json({ status: 'already_authenticated' });
+      return res.json({ qr: null, status: 'already_authenticated' });
     }
 
     let sent = false;
 
+    const qrHandler = async (update) => {
+      if (update.qr && !sent) {
+        sent = true;
+        res.json({ qr: update.qr, status: 'pending_qr' });
+        clearTimeout(timeout);
+      }
+      if (update.connection === 'open') {
+        if (!sent) {
+          sent = true;
+          res.json({ qr: null, status: 'connected' });
+        }
+        clearTimeout(timeout);
+      }
+    };
+
+    sock.ev.on('connection.update', qrHandler);
+
     const timeout = setTimeout(() => {
       if (!sent) {
         sent = true;
-        res.status(504).json({ error: 'QR code timeout' });
+        res.status(500).json({ error: 'QR code timeout' });
       }
     }, 10000);
-
-    sock.ev.on('connection.update', async (update) => {
-      if (update.qr && !sent) {
-        sent = true;
-        clearTimeout(timeout);
-        
-        const qrImageBuffer = await qrcode.toBuffer(update.qr);
-
-        res.writeHead(200, {
-          'Content-Type': 'image/png',
-          'Content-Length': qrImageBuffer.length,
-        });
-        res.end(qrImageBuffer);
-      }
-
-      if (update.connection === 'open' && !sent) {
-        sent = true;
-        clearTimeout(timeout);
-        res.json({ status: 'connected' });
-      }
-    });
-
   } catch (err) {
     console.error('QR Error:', err);
-    return res.status(500).json({ error: 'Internal error generating QR' });
+    res.status(500).json({ error: 'Internal error generating QR' });
   }
 });
-
 
 // POST /send/:sessionId/:number/:message
 app.post('/send/:sessionId/:number/:message', async (req, res) => {
