@@ -7,16 +7,28 @@ const path = require('path');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const compression = require('compression');
+const { createClient } = require('@supabase/supabase-js');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Initialize Supabase client
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // Use service role for backend operations
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+if (!supabaseUrl || !supabaseServiceKey) {
+  console.error('❌ Missing Supabase configuration. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
+  process.exit(1);
+}
 
 // Security and performance middleware
 app.use(helmet());
 app.use(compression());
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
-    ? ['https://your-frontend-domain.com'] 
+    ? (process.env.FRONTEND_URLS ? process.env.FRONTEND_URLS.split(',') : ['https://your-frontend-domain.com'])
     : ['http://localhost:5173', 'http://localhost:3000'],
   credentials: true
 }));
@@ -43,10 +55,8 @@ const sendLimiter = rateLimit({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// In-memory storage for WhatsApp clients and session data
+// In-memory storage for WhatsApp clients
 const clients = new Map();
-const qrCodes = new Map();
-const sessionStatus = new Map();
 
 // Ensure sessions directory exists
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
@@ -62,66 +72,145 @@ async function ensureSessionsDir() {
 // Initialize sessions directory on startup
 ensureSessionsDir();
 
-// Utility function to clean up inactive sessions
-function cleanupInactiveSessions() {
-  const now = Date.now();
-  const INACTIVE_TIMEOUT = 30 * 60 * 1000; // 30 minutes
-
-  for (const [sessionId, lastActivity] of sessionStatus.entries()) {
-    if (now - lastActivity.timestamp > INACTIVE_TIMEOUT && lastActivity.status !== 'connected') {
-      console.log(`Cleaning up inactive session: ${sessionId}`);
-      
-      if (clients.has(sessionId)) {
-        const client = clients.get(sessionId);
-        try {
-          client.destroy();
-        } catch (error) {
-          console.error(`Error destroying client ${sessionId}:`, error);
-        }
-        clients.delete(sessionId);
-      }
-      
-      qrCodes.delete(sessionId);
-      sessionStatus.delete(sessionId);
+// Middleware to verify Supabase JWT token
+async function verifyAuth(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Authorization token required' 
+      });
     }
+
+    const token = authHeader.substring(7);
+    
+    // Verify the JWT token with Supabase
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    
+    if (error || !user) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Invalid or expired token' 
+      });
+    }
+
+    req.user = user;
+    next();
+  } catch (error) {
+    console.error('Auth verification error:', error);
+    res.status(401).json({ 
+      success: false, 
+      error: 'Authentication failed' 
+    });
   }
 }
 
-// Run cleanup every 10 minutes
-setInterval(cleanupInactiveSessions, 10 * 60 * 1000);
+// Utility function to update session in database
+async function updateSessionInDB(sessionCode, updates) {
+  try {
+    const { error } = await supabase
+      .from('sessions')
+      .update({
+        ...updates,
+        updated_at: new Date().toISOString()
+      })
+      .eq('session_code', sessionCode);
 
-// Utility function to update session status
-function updateSessionStatus(sessionId, status, data = {}) {
-  sessionStatus.set(sessionId, {
-    status,
-    timestamp: Date.now(),
-    ...data
-  });
+    if (error) {
+      console.error('Error updating session in DB:', error);
+    }
+  } catch (error) {
+    console.error('Database update error:', error);
+  }
+}
+
+// Utility function to get session from database
+async function getSessionFromDB(sessionCode, userId = null) {
+  try {
+    let query = supabase
+      .from('sessions')
+      .select('*')
+      .eq('session_code', sessionCode);
+    
+    if (userId) {
+      query = query.eq('user_id', userId);
+    }
+    
+    const { data, error } = await query.single();
+    
+    if (error) {
+      console.error('Error fetching session from DB:', error);
+      return null;
+    }
+    
+    return data;
+  } catch (error) {
+    console.error('Database fetch error:', error);
+    return null;
+  }
 }
 
 // Utility function to validate phone number
 function validatePhoneNumber(phone) {
-  // Remove all non-digits except leading +
   const cleaned = phone.replace(/[^\d+]/g, '');
-  
-  // Basic validation - should start with + and have 10-15 digits
   const phoneRegex = /^\+[1-9]\d{9,14}$/;
   return phoneRegex.test(cleaned);
 }
 
 // Utility function to format phone number for WhatsApp
 function formatPhoneNumber(phone) {
-  // Remove all non-digits except leading +
   let formatted = phone.replace(/[^\d+]/g, '');
-  
-  // Add + if not present
   if (!formatted.startsWith('+')) {
     formatted = '+' + formatted;
   }
-  
-  // Add @c.us suffix for WhatsApp
   return formatted.substring(1) + '@c.us';
 }
+
+// Utility function to clean up inactive sessions
+async function cleanupInactiveSessions() {
+  const now = Date.now();
+  const INACTIVE_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+
+  try {
+    // Get sessions that haven't been updated in 30 minutes and are not connected
+    const { data: inactiveSessions, error } = await supabase
+      .from('sessions')
+      .select('session_code, status')
+      .lt('updated_at', new Date(now - INACTIVE_TIMEOUT).toISOString())
+      .neq('status', 'connected');
+
+    if (error) {
+      console.error('Error fetching inactive sessions:', error);
+      return;
+    }
+
+    for (const session of inactiveSessions) {
+      console.log(`Cleaning up inactive session: ${session.session_code}`);
+      
+      if (clients.has(session.session_code)) {
+        const client = clients.get(session.session_code);
+        try {
+          await client.destroy();
+        } catch (error) {
+          console.error(`Error destroying client ${session.session_code}:`, error);
+        }
+        clients.delete(session.session_code);
+      }
+      
+      // Update session status in database
+      await updateSessionInDB(session.session_code, { 
+        status: 'expired',
+        qr_code: null 
+      });
+    }
+  } catch (error) {
+    console.error('Cleanup error:', error);
+  }
+}
+
+// Run cleanup every 10 minutes
+setInterval(cleanupInactiveSessions, 10 * 60 * 1000);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -129,47 +218,87 @@ app.get('/health', (req, res) => {
     status: 'healthy', 
     timestamp: new Date().toISOString(),
     activeSessions: clients.size,
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    supabaseConnected: !!supabase
   });
 });
 
 // Get server statistics
-app.get('/stats', (req, res) => {
-  const stats = {
-    activeSessions: clients.size,
-    totalSessions: sessionStatus.size,
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    timestamp: new Date().toISOString()
-  };
-  
-  res.json(stats);
+app.get('/stats', verifyAuth, async (req, res) => {
+  try {
+    // Get user's sessions count from database
+    const { count: userSessionsCount } = await supabase
+      .from('sessions')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', req.user.id);
+
+    const stats = {
+      activeSessions: clients.size,
+      userSessions: userSessionsCount || 0,
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
+      timestamp: new Date().toISOString()
+    };
+    
+    res.json(stats);
+  } catch (error) {
+    console.error('Error fetching stats:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch statistics' 
+    });
+  }
 });
 
 // Initialize WhatsApp session
-app.post('/init/:sessionId', async (req, res) => {
-  const { sessionId } = req.params;
+app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
+  const { sessionCode } = req.params;
+  const userId = req.user.id;
   
   try {
-    // Check if session already exists
-    if (clients.has(sessionId)) {
-      const existingClient = clients.get(sessionId);
-      const state = await existingClient.getState();
-      
-      if (state === 'CONNECTED') {
-        updateSessionStatus(sessionId, 'connected');
-        return res.json({ 
-          success: true, 
-          message: 'Session already connected',
-          status: 'connected'
-        });
+    // Verify session belongs to user
+    const sessionData = await getSessionFromDB(sessionCode, userId);
+    if (!sessionData) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Session not found or access denied' 
+      });
+    }
+
+    // Check if session already exists and is connected
+    if (clients.has(sessionCode)) {
+      const existingClient = clients.get(sessionCode);
+      try {
+        const state = await existingClient.getState();
+        
+        if (state === 'CONNECTED') {
+          await updateSessionInDB(sessionCode, { 
+            status: 'connected',
+            last_connected_at: new Date().toISOString()
+          });
+          
+          return res.json({ 
+            success: true, 
+            message: 'Session already connected',
+            status: 'connected'
+          });
+        }
+      } catch (error) {
+        // Client exists but not responsive, clean it up
+        clients.delete(sessionCode);
       }
     }
+
+    // Update session status to connecting
+    await updateSessionInDB(sessionCode, { 
+      status: 'connecting',
+      qr_code: null 
+    });
 
     // Create new client with session persistence
     const client = new Client({
       authStrategy: new LocalAuth({
-        clientId: sessionId,
+        clientId: sessionCode,
         dataPath: SESSIONS_DIR
       }),
       puppeteer: {
@@ -192,44 +321,77 @@ app.post('/init/:sessionId', async (req, res) => {
     });
 
     // Store client
-    clients.set(sessionId, client);
-    updateSessionStatus(sessionId, 'initializing');
+    clients.set(sessionCode, client);
 
     // Set up event handlers
-    client.on('qr', (qr) => {
-      console.log(`QR Code generated for session ${sessionId}`);
-      qrCodes.set(sessionId, qr);
-      updateSessionStatus(sessionId, 'qr_ready');
-    });
-
-    client.on('ready', () => {
-      console.log(`WhatsApp client ${sessionId} is ready!`);
-      updateSessionStatus(sessionId, 'connected');
-      qrCodes.delete(sessionId); // Remove QR code once connected
-    });
-
-    client.on('authenticated', () => {
-      console.log(`WhatsApp client ${sessionId} authenticated`);
-      updateSessionStatus(sessionId, 'authenticated');
-    });
-
-    client.on('auth_failure', (msg) => {
-      console.error(`Authentication failed for session ${sessionId}:`, msg);
-      updateSessionStatus(sessionId, 'auth_failed', { error: msg });
-    });
-
-    client.on('disconnected', (reason) => {
-      console.log(`WhatsApp client ${sessionId} disconnected:`, reason);
-      updateSessionStatus(sessionId, 'disconnected', { reason });
+    client.on('qr', async (qr) => {
+      console.log(`QR Code generated for session ${sessionCode}`);
       
-      // Clean up
-      clients.delete(sessionId);
-      qrCodes.delete(sessionId);
+      try {
+        // Generate QR code image
+        const qrCodeImage = await qrcode.toDataURL(qr, {
+          width: 256,
+          margin: 2,
+          color: {
+            dark: '#000000',
+            light: '#FFFFFF'
+          }
+        });
+
+        // Update session with QR code in database
+        await updateSessionInDB(sessionCode, { 
+          status: 'connecting',
+          qr_code: qrCodeImage 
+        });
+      } catch (error) {
+        console.error('Error generating QR code:', error);
+      }
+    });
+
+    client.on('ready', async () => {
+      console.log(`WhatsApp client ${sessionCode} is ready!`);
+      
+      await updateSessionInDB(sessionCode, { 
+        status: 'connected',
+        last_connected_at: new Date().toISOString(),
+        qr_code: null 
+      });
+    });
+
+    client.on('authenticated', async () => {
+      console.log(`WhatsApp client ${sessionCode} authenticated`);
+      
+      await updateSessionInDB(sessionCode, { 
+        status: 'connected',
+        last_connected_at: new Date().toISOString()
+      });
+    });
+
+    client.on('auth_failure', async (msg) => {
+      console.error(`Authentication failed for session ${sessionCode}:`, msg);
+      
+      await updateSessionInDB(sessionCode, { 
+        status: 'expired',
+        qr_code: null 
+      });
+      
+      clients.delete(sessionCode);
+    });
+
+    client.on('disconnected', async (reason) => {
+      console.log(`WhatsApp client ${sessionCode} disconnected:`, reason);
+      
+      await updateSessionInDB(sessionCode, { 
+        status: 'disconnected',
+        qr_code: null 
+      });
+      
+      clients.delete(sessionCode);
     });
 
     client.on('message', (message) => {
       // Log incoming messages for debugging
-      console.log(`Message received in session ${sessionId}:`, message.from);
+      console.log(`Message received in session ${sessionCode}:`, message.from);
     });
 
     // Initialize the client
@@ -238,13 +400,17 @@ app.post('/init/:sessionId', async (req, res) => {
     res.json({ 
       success: true, 
       message: 'Session initialization started',
-      sessionId,
-      status: 'initializing'
+      sessionCode,
+      status: 'connecting'
     });
 
   } catch (error) {
-    console.error(`Error initializing session ${sessionId}:`, error);
-    updateSessionStatus(sessionId, 'error', { error: error.message });
+    console.error(`Error initializing session ${sessionCode}:`, error);
+    
+    await updateSessionInDB(sessionCode, { 
+      status: 'expired',
+      qr_code: null 
+    });
     
     res.status(500).json({ 
       success: false, 
@@ -255,87 +421,118 @@ app.post('/init/:sessionId', async (req, res) => {
 });
 
 // Get QR code for session
-app.post('/qrcode', async (req, res) => {
-  const { sessionId } = req.body;
+app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
+  const { sessionCode } = req.params;
+  const userId = req.user.id;
   
-  if (!sessionId) {
-    return res.status(400).json({ 
-      success: false, 
-      error: 'Session ID is required' 
-    });
-  }
-
   try {
-    const qr = qrCodes.get(sessionId);
-    
-    if (!qr) {
+    // Verify session belongs to user and get QR code from database
+    const sessionData = await getSessionFromDB(sessionCode, userId);
+    if (!sessionData) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Session not found or access denied' 
+      });
+    }
+
+    if (!sessionData.qr_code) {
       return res.status(404).json({ 
         success: false, 
         error: 'QR code not available. Please initialize session first.' 
       });
     }
 
-    // Generate QR code image
-    const qrCodeImage = await qrcode.toDataURL(qr, {
-      width: 256,
-      margin: 2,
-      color: {
-        dark: '#000000',
-        light: '#FFFFFF'
-      }
-    });
-
     res.json({ 
       success: true, 
-      qrCode: qrCodeImage 
+      qrCode: sessionData.qr_code 
     });
 
   } catch (error) {
-    console.error(`Error generating QR code for session ${sessionId}:`, error);
+    console.error(`Error getting QR code for session ${sessionCode}:`, error);
     res.status(500).json({ 
       success: false, 
-      error: 'Failed to generate QR code',
+      error: 'Failed to get QR code',
       details: error.message 
     });
   }
 });
 
 // Get session status
-app.get('/status/:sessionId', (req, res) => {
-  const { sessionId } = req.params;
+app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
+  const { sessionCode } = req.params;
+  const userId = req.user.id;
   
-  const status = sessionStatus.get(sessionId);
-  const hasClient = clients.has(sessionId);
-  
-  if (!status && !hasClient) {
-    return res.json({ 
-      connected: false, 
-      status: 'not_initialized',
-      message: 'Session not found'
+  try {
+    // Get session from database
+    const sessionData = await getSessionFromDB(sessionCode, userId);
+    if (!sessionData) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Session not found or access denied' 
+      });
+    }
+
+    const hasClient = clients.has(sessionCode);
+    let actualStatus = sessionData.status;
+
+    // If we have a client, check its actual state
+    if (hasClient) {
+      try {
+        const client = clients.get(sessionCode);
+        const state = await client.getState();
+        
+        if (state === 'CONNECTED' && sessionData.status !== 'connected') {
+          actualStatus = 'connected';
+          await updateSessionInDB(sessionCode, { 
+            status: 'connected',
+            last_connected_at: new Date().toISOString()
+          });
+        } else if (state !== 'CONNECTED' && sessionData.status === 'connected') {
+          actualStatus = 'disconnected';
+          await updateSessionInDB(sessionCode, { status: 'disconnected' });
+        }
+      } catch (error) {
+        console.error('Error checking client state:', error);
+        actualStatus = 'disconnected';
+      }
+    }
+    
+    res.json({ 
+      connected: actualStatus === 'connected',
+      status: actualStatus,
+      lastConnected: sessionData.last_connected_at,
+      hasClient
+    });
+
+  } catch (error) {
+    console.error(`Error getting status for session ${sessionCode}:`, error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to get session status' 
     });
   }
-
-  const currentStatus = status ? status.status : 'unknown';
-  
-  res.json({ 
-    connected: currentStatus === 'connected',
-    status: currentStatus,
-    timestamp: status ? status.timestamp : null,
-    hasClient
-  });
 });
 
 // Send message to a single contact
-app.post('/send/:sessionId/:number/:message', sendLimiter, async (req, res) => {
-  const { sessionId, number, message } = req.params;
+app.post('/send/:sessionCode/:number/:message', verifyAuth, sendLimiter, async (req, res) => {
+  const { sessionCode, number, message } = req.params;
+  const userId = req.user.id;
   
   try {
-    const client = clients.get(sessionId);
-    
+    // Verify session belongs to user
+    const sessionData = await getSessionFromDB(sessionCode, userId);
+    if (!sessionData) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Session not found or access denied' 
+      });
+    }
+
+    const client = clients.get(sessionCode);
     if (!client) {
       return res.status(404).json({ 
         success: false, 
-        error: 'Session not found or not connected' 
+        error: 'Session not connected. Please connect first.' 
       });
     }
 
@@ -372,7 +569,10 @@ app.post('/send/:sessionId/:number/:message', sendLimiter, async (req, res) => {
     // Send message
     const sentMessage = await client.sendMessage(formattedNumber, decodedMessage);
     
-    updateSessionStatus(sessionId, 'connected'); // Update last activity
+    // Update session last activity
+    await updateSessionInDB(sessionCode, { 
+      last_connected_at: new Date().toISOString() 
+    });
     
     res.json({ 
       success: true, 
@@ -383,7 +583,7 @@ app.post('/send/:sessionId/:number/:message', sendLimiter, async (req, res) => {
     });
 
   } catch (error) {
-    console.error(`Error sending message in session ${sessionId}:`, error);
+    console.error(`Error sending message in session ${sessionCode}:`, error);
     res.status(500).json({ 
       success: false, 
       error: 'Failed to send message',
@@ -393,17 +593,26 @@ app.post('/send/:sessionId/:number/:message', sendLimiter, async (req, res) => {
 });
 
 // Send bulk messages
-app.post('/send-bulk/:sessionId', sendLimiter, async (req, res) => {
-  const { sessionId } = req.params;
+app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) => {
+  const { sessionCode } = req.params;
   const { contacts, message, interval = 5000 } = req.body;
+  const userId = req.user.id;
   
   try {
-    const client = clients.get(sessionId);
-    
+    // Verify session belongs to user
+    const sessionData = await getSessionFromDB(sessionCode, userId);
+    if (!sessionData) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Session not found or access denied' 
+      });
+    }
+
+    const client = clients.get(sessionCode);
     if (!client) {
       return res.status(404).json({ 
         success: false, 
-        error: 'Session not found or not connected' 
+        error: 'Session not connected. Please connect first.' 
       });
     }
 
@@ -486,7 +695,10 @@ app.post('/send-bulk/:sessionId', sendLimiter, async (req, res) => {
       }
     }
 
-    updateSessionStatus(sessionId, 'connected'); // Update last activity
+    // Update session last activity
+    await updateSessionInDB(sessionCode, { 
+      last_connected_at: new Date().toISOString() 
+    });
     
     const successCount = results.filter(r => r.status === 'sent').length;
     const failedCount = results.filter(r => r.status === 'failed').length;
@@ -502,7 +714,7 @@ app.post('/send-bulk/:sessionId', sendLimiter, async (req, res) => {
     });
 
   } catch (error) {
-    console.error(`Error in bulk send for session ${sessionId}:`, error);
+    console.error(`Error in bulk send for session ${sessionCode}:`, error);
     res.status(500).json({ 
       success: false, 
       error: 'Failed to send bulk messages',
@@ -512,26 +724,37 @@ app.post('/send-bulk/:sessionId', sendLimiter, async (req, res) => {
 });
 
 // Disconnect session
-app.post('/disconnect/:sessionId', async (req, res) => {
-  const { sessionId } = req.params;
+app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
+  const { sessionCode } = req.params;
+  const userId = req.user.id;
   
   try {
-    const client = clients.get(sessionId);
-    
-    if (!client) {
+    // Verify session belongs to user
+    const sessionData = await getSessionFromDB(sessionCode, userId);
+    if (!sessionData) {
       return res.status(404).json({ 
         success: false, 
-        error: 'Session not found' 
+        error: 'Session not found or access denied' 
       });
     }
 
-    await client.logout();
-    await client.destroy();
+    const client = clients.get(sessionCode);
     
-    // Clean up
-    clients.delete(sessionId);
-    qrCodes.delete(sessionId);
-    updateSessionStatus(sessionId, 'disconnected');
+    if (client) {
+      try {
+        await client.logout();
+        await client.destroy();
+      } catch (error) {
+        console.error(`Error destroying client ${sessionCode}:`, error);
+      }
+      clients.delete(sessionCode);
+    }
+    
+    // Update session status in database
+    await updateSessionInDB(sessionCode, { 
+      status: 'disconnected',
+      qr_code: null 
+    });
 
     res.json({ 
       success: true, 
@@ -539,12 +762,14 @@ app.post('/disconnect/:sessionId', async (req, res) => {
     });
 
   } catch (error) {
-    console.error(`Error disconnecting session ${sessionId}:`, error);
+    console.error(`Error disconnecting session ${sessionCode}:`, error);
     
-    // Force cleanup even if there's an error
-    clients.delete(sessionId);
-    qrCodes.delete(sessionId);
-    updateSessionStatus(sessionId, 'disconnected');
+    // Force cleanup
+    clients.delete(sessionCode);
+    await updateSessionInDB(sessionCode, { 
+      status: 'disconnected',
+      qr_code: null 
+    });
     
     res.json({ 
       success: true, 
@@ -554,20 +779,40 @@ app.post('/disconnect/:sessionId', async (req, res) => {
   }
 });
 
-// Get all active sessions
-app.get('/sessions', (req, res) => {
-  const sessions = Array.from(sessionStatus.entries()).map(([id, data]) => ({
-    sessionId: id,
-    status: data.status,
-    timestamp: data.timestamp,
-    hasClient: clients.has(id)
-  }));
+// Get user's sessions
+app.get('/sessions', verifyAuth, async (req, res) => {
+  const userId = req.user.id;
   
-  res.json({ 
-    success: true, 
-    sessions,
-    total: sessions.length 
-  });
+  try {
+    const { data: sessions, error } = await supabase
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      throw error;
+    }
+
+    const sessionsWithStatus = sessions.map(session => ({
+      ...session,
+      hasClient: clients.has(session.session_code),
+      isActive: clients.has(session.session_code) && session.status === 'connected'
+    }));
+    
+    res.json({ 
+      success: true, 
+      sessions: sessionsWithStatus,
+      total: sessions.length 
+    });
+
+  } catch (error) {
+    console.error('Error fetching user sessions:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch sessions' 
+    });
+  }
 });
 
 // Validate phone number endpoint
@@ -614,13 +859,17 @@ app.use((req, res) => {
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down gracefully...');
   
-  // Disconnect all clients
-  for (const [sessionId, client] of clients.entries()) {
+  // Disconnect all clients and update database
+  for (const [sessionCode, client] of clients.entries()) {
     try {
-      console.log(`Disconnecting session ${sessionId}...`);
+      console.log(`Disconnecting session ${sessionCode}...`);
       await client.destroy();
+      await updateSessionInDB(sessionCode, { 
+        status: 'disconnected',
+        qr_code: null 
+      });
     } catch (error) {
-      console.error(`Error disconnecting session ${sessionId}:`, error);
+      console.error(`Error disconnecting session ${sessionCode}:`, error);
     }
   }
   
@@ -630,13 +879,17 @@ process.on('SIGTERM', async () => {
 process.on('SIGINT', async () => {
   console.log('SIGINT received, shutting down gracefully...');
   
-  // Disconnect all clients
-  for (const [sessionId, client] of clients.entries()) {
+  // Disconnect all clients and update database
+  for (const [sessionCode, client] of clients.entries()) {
     try {
-      console.log(`Disconnecting session ${sessionId}...`);
+      console.log(`Disconnecting session ${sessionCode}...`);
       await client.destroy();
+      await updateSessionInDB(sessionCode, { 
+        status: 'disconnected',
+        qr_code: null 
+      });
     } catch (error) {
-      console.error(`Error disconnecting session ${sessionId}:`, error);
+      console.error(`Error disconnecting session ${sessionCode}:`, error);
     }
   }
   
@@ -649,6 +902,7 @@ app.listen(PORT, () => {
   console.log(`📱 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`💾 Sessions directory: ${SESSIONS_DIR}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+  console.log(`🗄️  Supabase connected: ${!!supabase}`);
 });
 
 module.exports = app;
