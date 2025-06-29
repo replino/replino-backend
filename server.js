@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3001;
 
 // Initialize Supabase client
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // Use service role for backend operations
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
 if (!supabaseUrl || !supabaseServiceKey) {
@@ -35,8 +35,8 @@ app.use(cors({
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 1000, // limit each IP to 1000 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
@@ -45,8 +45,8 @@ app.use(limiter);
 
 // Stricter rate limiting for message sending
 const sendLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 60, // limit each IP to 60 message sends per minute
+  windowMs: 60 * 1000,
+  max: 60,
   message: 'Too many messages sent, please slow down.',
   standardHeaders: true,
   legacyHeaders: false,
@@ -55,8 +55,9 @@ const sendLimiter = rateLimit({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// In-memory storage for WhatsApp clients
+// In-memory storage for WhatsApp clients and QR codes
 const clients = new Map();
+const qrCodeCache = new Map();
 
 // Ensure sessions directory exists
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
@@ -84,8 +85,6 @@ async function verifyAuth(req, res, next) {
     }
 
     const token = authHeader.substring(7);
-    
-    // Verify the JWT token with Supabase
     const { data: { user }, error } = await supabase.auth.getUser(token);
     
     if (error || !user) {
@@ -167,51 +166,6 @@ function formatPhoneNumber(phone) {
   return formatted.substring(1) + '@c.us';
 }
 
-// Utility function to clean up inactive sessions
-async function cleanupInactiveSessions() {
-  const now = Date.now();
-  const INACTIVE_TIMEOUT = 30 * 60 * 1000; // 30 minutes
-
-  try {
-    // Get sessions that haven't been updated in 30 minutes and are not connected
-    const { data: inactiveSessions, error } = await supabase
-      .from('sessions')
-      .select('session_code, status')
-      .lt('updated_at', new Date(now - INACTIVE_TIMEOUT).toISOString())
-      .neq('status', 'connected');
-
-    if (error) {
-      console.error('Error fetching inactive sessions:', error);
-      return;
-    }
-
-    for (const session of inactiveSessions) {
-      console.log(`Cleaning up inactive session: ${session.session_code}`);
-      
-      if (clients.has(session.session_code)) {
-        const client = clients.get(session.session_code);
-        try {
-          await client.destroy();
-        } catch (error) {
-          console.error(`Error destroying client ${session.session_code}:`, error);
-        }
-        clients.delete(session.session_code);
-      }
-      
-      // Update session status in database
-      await updateSessionInDB(session.session_code, { 
-        status: 'expired',
-        qr_code: null 
-      });
-    }
-  } catch (error) {
-    console.error('Cleanup error:', error);
-  }
-}
-
-// Run cleanup every 10 minutes
-setInterval(cleanupInactiveSessions, 10 * 60 * 1000);
-
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
@@ -226,7 +180,6 @@ app.get('/health', (req, res) => {
 // Get server statistics
 app.get('/stats', verifyAuth, async (req, res) => {
   try {
-    // Get user's sessions count from database
     const { count: userSessionsCount } = await supabase
       .from('sessions')
       .select('*', { count: 'exact', head: true })
@@ -286,6 +239,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       } catch (error) {
         // Client exists but not responsive, clean it up
         clients.delete(sessionCode);
+        qrCodeCache.delete(sessionCode);
       }
     }
 
@@ -323,9 +277,10 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
     // Store client
     clients.set(sessionCode, client);
 
-    // Set up event handlers
+    // Set up event handlers with enhanced logging
     client.on('qr', async (qr) => {
       console.log(`QR Code generated for session ${sessionCode}`);
+      console.log(`QR data length: ${qr.length}`);
       
       try {
         // Generate QR code image
@@ -338,11 +293,16 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
           }
         });
 
+        // Store in memory cache for immediate access
+        qrCodeCache.set(sessionCode, qrCodeImage);
+
         // Update session with QR code in database
         await updateSessionInDB(sessionCode, { 
           status: 'connecting',
           qr_code: qrCodeImage 
         });
+
+        console.log(`QR code stored for session ${sessionCode}`);
       } catch (error) {
         console.error('Error generating QR code:', error);
       }
@@ -350,6 +310,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('ready', async () => {
       console.log(`WhatsApp client ${sessionCode} is ready!`);
+      qrCodeCache.delete(sessionCode);
       
       await updateSessionInDB(sessionCode, { 
         status: 'connected',
@@ -360,6 +321,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('authenticated', async () => {
       console.log(`WhatsApp client ${sessionCode} authenticated`);
+      qrCodeCache.delete(sessionCode);
       
       await updateSessionInDB(sessionCode, { 
         status: 'connected',
@@ -369,6 +331,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('auth_failure', async (msg) => {
       console.error(`Authentication failed for session ${sessionCode}:`, msg);
+      qrCodeCache.delete(sessionCode);
       
       await updateSessionInDB(sessionCode, { 
         status: 'expired',
@@ -380,6 +343,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('disconnected', async (reason) => {
       console.log(`WhatsApp client ${sessionCode} disconnected:`, reason);
+      qrCodeCache.delete(sessionCode);
       
       await updateSessionInDB(sessionCode, { 
         status: 'disconnected',
@@ -389,13 +353,10 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       clients.delete(sessionCode);
     });
 
-    client.on('message', (message) => {
-      // Log incoming messages for debugging
-      console.log(`Message received in session ${sessionCode}:`, message.from);
-    });
-
     // Initialize the client
+    console.log(`Initializing WhatsApp client for session ${sessionCode}`);
     await client.initialize();
+    console.log(`Client initialization started for ${sessionCode}`);
 
     res.json({ 
       success: true, 
@@ -406,6 +367,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
   } catch (error) {
     console.error(`Error initializing session ${sessionCode}:`, error);
+    qrCodeCache.delete(sessionCode);
     
     await updateSessionInDB(sessionCode, { 
       status: 'expired',
@@ -426,6 +388,14 @@ app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
   const userId = req.user.id;
   
   try {
+    // Check memory cache first
+    if (qrCodeCache.has(sessionCode)) {
+      return res.json({ 
+        success: true, 
+        qrCode: qrCodeCache.get(sessionCode)
+      });
+    }
+
     // Verify session belongs to user and get QR code from database
     const sessionData = await getSessionFromDB(sessionCode, userId);
     if (!sessionData) {
@@ -498,10 +468,12 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
     }
     
     res.json({ 
+      success: true,
       connected: actualStatus === 'connected',
       status: actualStatus,
       lastConnected: sessionData.last_connected_at,
-      hasClient
+      hasClient,
+      qrCode: sessionData.qr_code
     });
 
   } catch (error) {
@@ -748,6 +720,7 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
         console.error(`Error destroying client ${sessionCode}:`, error);
       }
       clients.delete(sessionCode);
+      qrCodeCache.delete(sessionCode);
     }
     
     // Update session status in database
@@ -766,6 +739,7 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
     
     // Force cleanup
     clients.delete(sessionCode);
+    qrCodeCache.delete(sessionCode);
     await updateSessionInDB(sessionCode, { 
       status: 'disconnected',
       qr_code: null 
@@ -859,7 +833,6 @@ app.use((req, res) => {
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down gracefully...');
   
-  // Disconnect all clients and update database
   for (const [sessionCode, client] of clients.entries()) {
     try {
       console.log(`Disconnecting session ${sessionCode}...`);
@@ -879,7 +852,6 @@ process.on('SIGTERM', async () => {
 process.on('SIGINT', async () => {
   console.log('SIGINT received, shutting down gracefully...');
   
-  // Disconnect all clients and update database
   for (const [sessionCode, client] of clients.entries()) {
     try {
       console.log(`Disconnecting session ${sessionCode}...`);
