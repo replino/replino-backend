@@ -13,22 +13,35 @@ const jwt = require('jsonwebtoken');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Initialize Supabase client
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const supabase = createClient(supabaseUrl, supabaseServiceKey);
+// Enhanced configuration
+const SESSIONS_DIR = path.join(__dirname, 'sessions');
+const MAX_QR_GENERATION_ATTEMPTS = 5;
+const QR_GENERATION_TIMEOUT = 30000; // 30 seconds
+const SESSION_CLEANUP_INTERVAL = 3600000; // 1 hour
+const WEB_VERSION = '2.2412.54';
 
-if (!supabaseUrl || !supabaseServiceKey) {
-  console.error('❌ Missing Supabase configuration. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
+// Initialize Supabase client
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('❌ Missing Supabase configuration');
   process.exit(1);
 }
+
+// Session storage
+const clients = new Map();
+const qrCodeCache = new Map();
+const sessionTimestamps = new Map();
 
 // Security and performance middleware
 app.use(helmet());
 app.use(compression());
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
-    ? (process.env.FRONTEND_URLS ? process.env.FRONTEND_URLS.split(',') : ['https://your-frontend-domain.com'])
+    ? (process.env.FRONTEND_URLS ? process.env.FRONTEND_URLS.split(',') : [])
     : ['http://localhost:5173', 'http://localhost:3000'],
   credentials: true
 }));
@@ -43,7 +56,6 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Stricter rate limiting for message sending
 const sendLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
@@ -55,13 +67,7 @@ const sendLimiter = rateLimit({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// In-memory storage for WhatsApp clients and QR codes
-const clients = new Map();
-const qrCodeCache = new Map();
-
 // Ensure sessions directory exists
-const SESSIONS_DIR = path.join(__dirname, 'sessions');
-
 async function ensureSessionsDir() {
   try {
     await fs.access(SESSIONS_DIR);
@@ -70,61 +76,76 @@ async function ensureSessionsDir() {
   }
 }
 
-// Initialize sessions directory on startup
-ensureSessionsDir();
+// Session cleanup
+async function cleanupOldSessions() {
+  try {
+    const now = Date.now();
+    const threshold = 24 * 60 * 60 * 1000; // 24 hours
+    
+    for (const [sessionCode, timestamp] of sessionTimestamps) {
+      if (now - timestamp > threshold) {
+        const client = clients.get(sessionCode);
+        if (client) {
+          try {
+            await client.destroy();
+          } catch (error) {
+            console.error(`Error destroying old session ${sessionCode}:`, error);
+          }
+        }
+        clients.delete(sessionCode);
+        qrCodeCache.delete(sessionCode);
+        sessionTimestamps.delete(sessionCode);
+        
+        // Delete session files
+        try {
+          const sessionPath = path.join(SESSIONS_DIR, `session-${sessionCode}`);
+          await fs.rm(sessionPath, { recursive: true, force: true });
+        } catch (error) {
+          console.error(`Error deleting session files for ${sessionCode}:`, error);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error during session cleanup:', error);
+  }
+}
 
-// Middleware to verify Supabase JWT token
+// Auth middleware
 async function verifyAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ 
-        success: false, 
-        error: 'Authorization token required' 
-      });
+      return res.status(401).json({ success: false, error: 'Authorization token required' });
     }
 
     const token = authHeader.substring(7);
     const { data: { user }, error } = await supabase.auth.getUser(token);
     
     if (error || !user) {
-      return res.status(401).json({ 
-        success: false, 
-        error: 'Invalid or expired token' 
-      });
+      return res.status(401).json({ success: false, error: 'Invalid or expired token' });
     }
 
     req.user = user;
     next();
   } catch (error) {
-    console.error('Auth verification error:', error);
-    res.status(401).json({ 
-      success: false, 
-      error: 'Authentication failed' 
-    });
+    res.status(401).json({ success: false, error: 'Authentication failed' });
   }
 }
 
-// Utility function to update session in database
+// Database functions
 async function updateSessionInDB(sessionCode, updates) {
   try {
     const { error } = await supabase
       .from('sessions')
-      .update({
-        ...updates,
-        updated_at: new Date().toISOString()
-      })
+      .update({ ...updates, updated_at: new Date().toISOString() })
       .eq('session_code', sessionCode);
 
-    if (error) {
-      console.error('Error updating session in DB:', error);
-    }
+    if (error) console.error('Error updating session in DB:', error);
   } catch (error) {
     console.error('Database update error:', error);
   }
 }
 
-// Utility function to get session from database
 async function getSessionFromDB(sessionCode, userId = null) {
   try {
     let query = supabase
@@ -132,41 +153,51 @@ async function getSessionFromDB(sessionCode, userId = null) {
       .select('*')
       .eq('session_code', sessionCode);
     
-    if (userId) {
-      query = query.eq('user_id', userId);
-    }
+    if (userId) query = query.eq('user_id', userId);
     
     const { data, error } = await query.single();
-    
-    if (error) {
-      console.error('Error fetching session from DB:', error);
-      return null;
-    }
-    
-    return data;
+    return error ? null : data;
   } catch (error) {
     console.error('Database fetch error:', error);
     return null;
   }
 }
 
-// Utility function to validate phone number
+// Phone number validation
 function validatePhoneNumber(phone) {
   const cleaned = phone.replace(/[^\d+]/g, '');
-  const phoneRegex = /^\+[1-9]\d{9,14}$/;
-  return phoneRegex.test(cleaned);
+  return /^\+[1-9]\d{9,14}$/.test(cleaned);
 }
 
-// Utility function to format phone number for WhatsApp
 function formatPhoneNumber(phone) {
   let formatted = phone.replace(/[^\d+]/g, '');
-  if (!formatted.startsWith('+')) {
-    formatted = '+' + formatted;
-  }
+  if (!formatted.startsWith('+')) formatted = '+' + formatted;
   return formatted.substring(1) + '@c.us';
 }
 
-// Health check endpoint
+// QR code generation with retries
+async function generateQRCodeWithRetry(qrData, attempts = 0) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), QR_GENERATION_TIMEOUT);
+
+    const qrCodeImage = await qrcode.toDataURL(qrData, {
+      width: 256,
+      margin: 2,
+      color: { dark: '#000000', light: '#FFFFFF' }
+    }, { signal: controller.signal });
+
+    clearTimeout(timeout);
+    return qrCodeImage;
+  } catch (error) {
+    if (attempts < MAX_QR_GENERATION_ATTEMPTS) {
+      return generateQRCodeWithRetry(qrData, attempts + 1);
+    }
+    throw error;
+  }
+}
+
+// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
@@ -177,7 +208,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Get server statistics
+// Server stats
 app.get('/stats', verifyAuth, async (req, res) => {
   try {
     const { count: userSessionsCount } = await supabase
@@ -185,21 +216,15 @@ app.get('/stats', verifyAuth, async (req, res) => {
       .select('*', { count: 'exact', head: true })
       .eq('user_id', req.user.id);
 
-    const stats = {
+    res.json({
       activeSessions: clients.size,
       userSessions: userSessionsCount || 0,
       uptime: process.uptime(),
       memory: process.memoryUsage(),
       timestamp: new Date().toISOString()
-    };
-    
-    res.json(stats);
-  } catch (error) {
-    console.error('Error fetching stats:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to fetch statistics' 
     });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Failed to fetch statistics' });
   }
 });
 
@@ -209,47 +234,32 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
   const userId = req.user.id;
   
   try {
-    // Verify session belongs to user
     const sessionData = await getSessionFromDB(sessionCode, userId);
     if (!sessionData) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Session not found or access denied' 
-      });
+      return res.status(404).json({ success: false, error: 'Session not found or access denied' });
     }
 
-    // Check if session already exists and is connected
+    // Check existing session
     if (clients.has(sessionCode)) {
       const existingClient = clients.get(sessionCode);
       try {
         const state = await existingClient.getState();
-        
         if (state === 'CONNECTED') {
           await updateSessionInDB(sessionCode, { 
             status: 'connected',
             last_connected_at: new Date().toISOString()
           });
-          
-          return res.json({ 
-            success: true, 
-            message: 'Session already connected',
-            status: 'connected'
-          });
+          return res.json({ success: true, message: 'Session already connected', status: 'connected' });
         }
-      } catch (error) {
-        // Client exists but not responsive, clean it up
+      } catch {
         clients.delete(sessionCode);
         qrCodeCache.delete(sessionCode);
       }
     }
 
-    // Update session status to connecting
-    await updateSessionInDB(sessionCode, { 
-      status: 'connecting',
-      qr_code: null 
-    });
+    await updateSessionInDB(sessionCode, { status: 'connecting', qr_code: null });
 
-    // Create new client with session persistence
+    // Create new client with enhanced configuration
     const client = new Client({
       authStrategy: new LocalAuth({
         clientId: sessionCode,
@@ -270,48 +280,28 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       },
       webVersionCache: {
         type: 'remote',
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-      }
+        remotePath: `https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/${WEB_VERSION}.html`,
+      },
+      takeoverOnConflict: true,
+      restartOnAuthFail: true
     });
 
-    // Store client
     clients.set(sessionCode, client);
+    sessionTimestamps.set(sessionCode, Date.now());
 
-    // Set up event handlers with enhanced logging
+    // Event handlers
     client.on('qr', async (qr) => {
-      console.log(`QR Code generated for session ${sessionCode}`);
-      console.log(`QR data length: ${qr.length}`);
-      
       try {
-        // Generate QR code image
-        const qrCodeImage = await qrcode.toDataURL(qr, {
-          width: 256,
-          margin: 2,
-          color: {
-            dark: '#000000',
-            light: '#FFFFFF'
-          }
-        });
-
-        // Store in memory cache for immediate access
+        const qrCodeImage = await generateQRCodeWithRetry(qr);
         qrCodeCache.set(sessionCode, qrCodeImage);
-
-        // Update session with QR code in database
-        await updateSessionInDB(sessionCode, { 
-          status: 'connecting',
-          qr_code: qrCodeImage 
-        });
-
-        console.log(`QR code stored for session ${sessionCode}`);
+        await updateSessionInDB(sessionCode, { status: 'connecting', qr_code: qrCodeImage });
       } catch (error) {
         console.error('Error generating QR code:', error);
       }
     });
 
     client.on('ready', async () => {
-      console.log(`WhatsApp client ${sessionCode} is ready!`);
       qrCodeCache.delete(sessionCode);
-      
       await updateSessionInDB(sessionCode, { 
         status: 'connected',
         last_connected_at: new Date().toISOString(),
@@ -320,9 +310,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
     });
 
     client.on('authenticated', async () => {
-      console.log(`WhatsApp client ${sessionCode} authenticated`);
       qrCodeCache.delete(sessionCode);
-      
       await updateSessionInDB(sessionCode, { 
         status: 'connected',
         last_connected_at: new Date().toISOString()
@@ -330,100 +318,48 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
     });
 
     client.on('auth_failure', async (msg) => {
-      console.error(`Authentication failed for session ${sessionCode}:`, msg);
       qrCodeCache.delete(sessionCode);
-      
-      await updateSessionInDB(sessionCode, { 
-        status: 'expired',
-        qr_code: null 
-      });
-      
+      await updateSessionInDB(sessionCode, { status: 'expired', qr_code: null });
       clients.delete(sessionCode);
     });
 
     client.on('disconnected', async (reason) => {
-      console.log(`WhatsApp client ${sessionCode} disconnected:`, reason);
       qrCodeCache.delete(sessionCode);
-      
-      await updateSessionInDB(sessionCode, { 
-        status: 'disconnected',
-        qr_code: null 
-      });
-      
+      await updateSessionInDB(sessionCode, { status: 'disconnected', qr_code: null });
       clients.delete(sessionCode);
     });
 
-    // Initialize the client
-    console.log(`Initializing WhatsApp client for session ${sessionCode}`);
     await client.initialize();
-    console.log(`Client initialization started for ${sessionCode}`);
-
-    res.json({ 
-      success: true, 
-      message: 'Session initialization started',
-      sessionCode,
-      status: 'connecting'
-    });
+    res.json({ success: true, message: 'Session initialization started', sessionCode, status: 'connecting' });
 
   } catch (error) {
-    console.error(`Error initializing session ${sessionCode}:`, error);
     qrCodeCache.delete(sessionCode);
-    
-    await updateSessionInDB(sessionCode, { 
-      status: 'expired',
-      qr_code: null 
-    });
-    
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to initialize session',
-      details: error.message 
-    });
+    res.status(500).json({ success: false, error: 'Failed to initialize session', details: error.message });
   }
 });
 
-// Get QR code for session
+// Get QR code
 app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
   const { sessionCode } = req.params;
   const userId = req.user.id;
   
   try {
-    // Check memory cache first
     if (qrCodeCache.has(sessionCode)) {
-      return res.json({ 
-        success: true, 
-        qrCode: qrCodeCache.get(sessionCode)
-      });
+      return res.json({ success: true, qrCode: qrCodeCache.get(sessionCode) });
     }
 
-    // Verify session belongs to user and get QR code from database
     const sessionData = await getSessionFromDB(sessionCode, userId);
     if (!sessionData) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Session not found or access denied' 
-      });
+      return res.status(404).json({ success: false, error: 'Session not found or access denied' });
     }
 
     if (!sessionData.qr_code) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'QR code not available. Please initialize session first.' 
-      });
+      return res.status(404).json({ success: false, error: 'QR code not available' });
     }
 
-    res.json({ 
-      success: true, 
-      qrCode: sessionData.qr_code 
-    });
-
+    res.json({ success: true, qrCode: sessionData.qr_code });
   } catch (error) {
-    console.error(`Error getting QR code for session ${sessionCode}:`, error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to get QR code',
-      details: error.message 
-    });
+    res.status(500).json({ success: false, error: 'Failed to get QR code', details: error.message });
   }
 });
 
@@ -433,19 +369,14 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
   const userId = req.user.id;
   
   try {
-    // Get session from database
     const sessionData = await getSessionFromDB(sessionCode, userId);
     if (!sessionData) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Session not found or access denied' 
-      });
+      return res.status(404).json({ success: false, error: 'Session not found or access denied' });
     }
 
     const hasClient = clients.has(sessionCode);
     let actualStatus = sessionData.status;
 
-    // If we have a client, check its actual state
     if (hasClient) {
       try {
         const client = clients.get(sessionCode);
@@ -462,7 +393,6 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
           await updateSessionInDB(sessionCode, { status: 'disconnected' });
         }
       } catch (error) {
-        console.error('Error checking client state:', error);
         actualStatus = 'disconnected';
       }
     }
@@ -475,76 +405,47 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
       hasClient,
       qrCode: sessionData.qr_code
     });
-
   } catch (error) {
-    console.error(`Error getting status for session ${sessionCode}:`, error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to get session status' 
-    });
+    res.status(500).json({ success: false, error: 'Failed to get session status' });
   }
 });
 
-// Send message to a single contact
+// Send message
 app.post('/send/:sessionCode/:number/:message', verifyAuth, sendLimiter, async (req, res) => {
   const { sessionCode, number, message } = req.params;
   const userId = req.user.id;
   
   try {
-    // Verify session belongs to user
     const sessionData = await getSessionFromDB(sessionCode, userId);
     if (!sessionData) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Session not found or access denied' 
-      });
+      return res.status(404).json({ success: false, error: 'Session not found or access denied' });
     }
 
     const client = clients.get(sessionCode);
     if (!client) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Session not connected. Please connect first.' 
-      });
+      return res.status(404).json({ success: false, error: 'Session not connected' });
     }
 
-    // Check if client is ready
     const state = await client.getState();
     if (state !== 'CONNECTED') {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'WhatsApp client is not connected',
-        state 
-      });
+      return res.status(400).json({ success: false, error: 'WhatsApp client is not connected', state });
     }
 
-    // Validate and format phone number
     if (!validatePhoneNumber(number)) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Invalid phone number format' 
-      });
+      return res.status(400).json({ success: false, error: 'Invalid phone number format' });
     }
 
     const formattedNumber = formatPhoneNumber(number);
     const decodedMessage = decodeURIComponent(message);
 
-    // Check if number exists on WhatsApp
     const isRegistered = await client.isRegisteredUser(formattedNumber);
     if (!isRegistered) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Number is not registered on WhatsApp' 
-      });
+      return res.status(400).json({ success: false, error: 'Number is not registered on WhatsApp' });
     }
 
-    // Send message
     const sentMessage = await client.sendMessage(formattedNumber, decodedMessage);
     
-    // Update session last activity
-    await updateSessionInDB(sessionCode, { 
-      last_connected_at: new Date().toISOString() 
-    });
+    await updateSessionInDB(sessionCode, { last_connected_at: new Date().toISOString() });
     
     res.json({ 
       success: true, 
@@ -553,14 +454,8 @@ app.post('/send/:sessionCode/:number/:message', verifyAuth, sendLimiter, async (
       message: decodedMessage,
       timestamp: new Date().toISOString()
     });
-
   } catch (error) {
-    console.error(`Error sending message in session ${sessionCode}:`, error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to send message',
-      details: error.message 
-    });
+    res.status(500).json({ success: false, error: 'Failed to send message', details: error.message });
   }
 });
 
@@ -571,80 +466,49 @@ app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) =>
   const userId = req.user.id;
   
   try {
-    // Verify session belongs to user
     const sessionData = await getSessionFromDB(sessionCode, userId);
     if (!sessionData) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Session not found or access denied' 
-      });
+      return res.status(404).json({ success: false, error: 'Session not found or access denied' });
     }
 
     const client = clients.get(sessionCode);
     if (!client) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Session not connected. Please connect first.' 
-      });
+      return res.status(404).json({ success: false, error: 'Session not connected' });
     }
 
-    // Check if client is ready
     const state = await client.getState();
     if (state !== 'CONNECTED') {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'WhatsApp client is not connected',
-        state 
-      });
+      return res.status(400).json({ success: false, error: 'WhatsApp client is not connected', state });
     }
 
     if (!Array.isArray(contacts) || contacts.length === 0) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Contacts array is required and cannot be empty' 
-      });
+      return res.status(400).json({ success: false, error: 'Contacts array is required' });
     }
 
     if (!message || message.trim().length === 0) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Message is required' 
-      });
+      return res.status(400).json({ success: false, error: 'Message is required' });
     }
 
     const results = [];
-    const maxInterval = Math.max(interval, 3000); // Minimum 3 seconds between messages
+    const maxInterval = Math.max(interval, 3000);
     
     for (let i = 0; i < contacts.length; i++) {
       const contact = contacts[i];
       
       try {
-        // Validate phone number
         if (!validatePhoneNumber(contact.phone)) {
-          results.push({
-            contact: contact.phone,
-            status: 'failed',
-            error: 'Invalid phone number format'
-          });
+          results.push({ contact: contact.phone, status: 'failed', error: 'Invalid phone number format' });
           continue;
         }
 
         const formattedNumber = formatPhoneNumber(contact.phone);
-        
-        // Check if number exists on WhatsApp
         const isRegistered = await client.isRegisteredUser(formattedNumber);
         if (!isRegistered) {
-          results.push({
-            contact: contact.phone,
-            status: 'failed',
-            error: 'Number not registered on WhatsApp'
-          });
+          results.push({ contact: contact.phone, status: 'failed', error: 'Number not registered on WhatsApp' });
           continue;
         }
 
-        // Send message
         const sentMessage = await client.sendMessage(formattedNumber, contact.message || message);
-        
         results.push({
           contact: contact.phone,
           status: 'sent',
@@ -652,46 +516,26 @@ app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) =>
           timestamp: new Date().toISOString()
         });
 
-        // Wait before sending next message (except for the last one)
         if (i < contacts.length - 1) {
           await new Promise(resolve => setTimeout(resolve, maxInterval));
         }
-
       } catch (error) {
-        console.error(`Error sending to ${contact.phone}:`, error);
-        results.push({
-          contact: contact.phone,
-          status: 'failed',
-          error: error.message
-        });
+        results.push({ contact: contact.phone, status: 'failed', error: error.message });
       }
     }
 
-    // Update session last activity
-    await updateSessionInDB(sessionCode, { 
-      last_connected_at: new Date().toISOString() 
-    });
+    await updateSessionInDB(sessionCode, { last_connected_at: new Date().toISOString() });
     
     const successCount = results.filter(r => r.status === 'sent').length;
     const failedCount = results.filter(r => r.status === 'failed').length;
     
     res.json({ 
       success: true,
-      summary: {
-        total: contacts.length,
-        sent: successCount,
-        failed: failedCount
-      },
+      summary: { total: contacts.length, sent: successCount, failed: failedCount },
       results
     });
-
   } catch (error) {
-    console.error(`Error in bulk send for session ${sessionCode}:`, error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to send bulk messages',
-      details: error.message 
-    });
+    res.status(500).json({ success: false, error: 'Failed to send bulk messages', details: error.message });
   }
 });
 
@@ -701,17 +545,12 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
   const userId = req.user.id;
   
   try {
-    // Verify session belongs to user
     const sessionData = await getSessionFromDB(sessionCode, userId);
     if (!sessionData) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Session not found or access denied' 
-      });
+      return res.status(404).json({ success: false, error: 'Session not found or access denied' });
     }
 
     const client = clients.get(sessionCode);
-    
     if (client) {
       try {
         await client.logout();
@@ -721,39 +560,21 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
       }
       clients.delete(sessionCode);
       qrCodeCache.delete(sessionCode);
+      sessionTimestamps.delete(sessionCode);
     }
     
-    // Update session status in database
-    await updateSessionInDB(sessionCode, { 
-      status: 'disconnected',
-      qr_code: null 
-    });
-
-    res.json({ 
-      success: true, 
-      message: 'Session disconnected successfully' 
-    });
-
+    await updateSessionInDB(sessionCode, { status: 'disconnected', qr_code: null });
+    res.json({ success: true, message: 'Session disconnected successfully' });
   } catch (error) {
-    console.error(`Error disconnecting session ${sessionCode}:`, error);
-    
-    // Force cleanup
     clients.delete(sessionCode);
     qrCodeCache.delete(sessionCode);
-    await updateSessionInDB(sessionCode, { 
-      status: 'disconnected',
-      qr_code: null 
-    });
-    
-    res.json({ 
-      success: true, 
-      message: 'Session disconnected (forced cleanup)',
-      warning: error.message 
-    });
+    sessionTimestamps.delete(sessionCode);
+    await updateSessionInDB(sessionCode, { status: 'disconnected', qr_code: null });
+    res.json({ success: true, message: 'Session disconnected (forced cleanup)', warning: error.message });
   }
 });
 
-// Get user's sessions
+// Get user sessions
 app.get('/sessions', verifyAuth, async (req, res) => {
   const userId = req.user.id;
   
@@ -764,9 +585,7 @@ app.get('/sessions', verifyAuth, async (req, res) => {
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
-    if (error) {
-      throw error;
-    }
+    if (error) throw error;
 
     const sessionsWithStatus = sessions.map(session => ({
       ...session,
@@ -774,30 +593,18 @@ app.get('/sessions', verifyAuth, async (req, res) => {
       isActive: clients.has(session.session_code) && session.status === 'connected'
     }));
     
-    res.json({ 
-      success: true, 
-      sessions: sessionsWithStatus,
-      total: sessions.length 
-    });
-
+    res.json({ success: true, sessions: sessionsWithStatus, total: sessions.length });
   } catch (error) {
-    console.error('Error fetching user sessions:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to fetch sessions' 
-    });
+    res.status(500).json({ success: false, error: 'Failed to fetch sessions' });
   }
 });
 
-// Validate phone number endpoint
+// Validate phone number
 app.post('/validate-phone', (req, res) => {
   const { phone } = req.body;
   
   if (!phone) {
-    return res.status(400).json({ 
-      success: false, 
-      error: 'Phone number is required' 
-    });
+    return res.status(400).json({ success: false, error: 'Phone number is required' });
   }
 
   const isValid = validatePhoneNumber(phone);
@@ -811,7 +618,7 @@ app.post('/validate-phone', (req, res) => {
   });
 });
 
-// Error handling middleware
+// Error handling
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
   res.status(500).json({ 
@@ -821,60 +628,41 @@ app.use((error, req, res, next) => {
   });
 });
 
-// 404 handler
 app.use((req, res) => {
-  res.status(404).json({ 
-    success: false, 
-    error: 'Endpoint not found' 
-  });
+  res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
 
 // Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully...');
+async function shutdown() {
+  console.log('Shutting down gracefully...');
   
   for (const [sessionCode, client] of clients.entries()) {
     try {
       console.log(`Disconnecting session ${sessionCode}...`);
       await client.destroy();
-      await updateSessionInDB(sessionCode, { 
-        status: 'disconnected',
-        qr_code: null 
-      });
+      await updateSessionInDB(sessionCode, { status: 'disconnected', qr_code: null });
     } catch (error) {
       console.error(`Error disconnecting session ${sessionCode}:`, error);
     }
   }
   
   process.exit(0);
-});
+}
 
-process.on('SIGINT', async () => {
-  console.log('SIGINT received, shutting down gracefully...');
-  
-  for (const [sessionCode, client] of clients.entries()) {
-    try {
-      console.log(`Disconnecting session ${sessionCode}...`);
-      await client.destroy();
-      await updateSessionInDB(sessionCode, { 
-        status: 'disconnected',
-        qr_code: null 
-      });
-    } catch (error) {
-      console.error(`Error disconnecting session ${sessionCode}:`, error);
-    }
-  }
-  
-  process.exit(0);
-});
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 WhatsApp Bulk Sender Backend running on port ${PORT}`);
-  console.log(`📱 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`💾 Sessions directory: ${SESSIONS_DIR}`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
-  console.log(`🗄️  Supabase connected: ${!!supabase}`);
-});
+// Initialize and start server
+(async () => {
+  await ensureSessionsDir();
+  setInterval(cleanupOldSessions, SESSION_CLEANUP_INTERVAL);
+
+  app.listen(PORT, () => {
+    console.log(`🚀 WhatsApp Bulk Sender Backend running on port ${PORT}`);
+    console.log(`📱 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`💾 Sessions directory: ${SESSIONS_DIR}`);
+    console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+  });
+})();
 
 module.exports = app;
