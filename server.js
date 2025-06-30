@@ -9,9 +9,18 @@ const helmet = require('helmet');
 const compression = require('compression');
 const { createClient } = require('@supabase/supabase-js');
 const jwt = require('jsonwebtoken');
+const Redis = require('ioredis');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Initialize Redis client for Upstash
+const redis = new Redis({
+  host: 'clean-panda-53790.upstash.io',
+  port: 6379,
+  password: 'AdIeAAIjcDE3ZDhjZTNlYTRmYWY0YTMxODNhZDc1MDVmZGQwNWVhOXAxMA',
+  tls: {}
+});
 
 // Initialize Supabase client
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -55,10 +64,8 @@ const sendLimiter = rateLimit({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// In-memory storage for WhatsApp clients and QR codes
+// In-memory storage for WhatsApp clients
 const clients = new Map();
-const qrCodeCache = new Map();
-const qrCodeGenerators = new Map();
 
 // Ensure sessions directory exists
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
@@ -174,7 +181,8 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     activeSessions: clients.size,
     uptime: process.uptime(),
-    supabaseConnected: !!supabase
+    supabaseConnected: !!supabase,
+    redisConnected: redis.status === 'ready'
   });
 });
 
@@ -191,7 +199,8 @@ app.get('/stats', verifyAuth, async (req, res) => {
       userSessions: userSessionsCount || 0,
       uptime: process.uptime(),
       memory: process.memoryUsage(),
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      redisStatus: redis.status
     };
     
     res.json(stats);
@@ -240,7 +249,6 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       } catch (error) {
         // Client exists but not responsive, clean it up
         clients.delete(sessionCode);
-        qrCodeCache.delete(sessionCode);
       }
     }
 
@@ -297,8 +305,8 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
           }
         });
 
-        // Store in memory cache for immediate access
-        qrCodeCache.set(sessionCode, qrCodeImage);
+        // Store in Redis cache for faster access
+        await redis.setex(`qr:${sessionCode}`, 300, qrCodeImage);
 
         // Update session with QR code in database
         await updateSessionInDB(sessionCode, { 
@@ -318,7 +326,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('authenticated', async () => {
       console.log(`WhatsApp client ${sessionCode} authenticated`);
-      qrCodeCache.delete(sessionCode);
+      await redis.del(`qr:${sessionCode}`);
       
       await updateSessionInDB(sessionCode, { 
         status: 'connected',
@@ -328,7 +336,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('auth_failure', async (msg) => {
       console.error(`Authentication failed for session ${sessionCode}:`, msg);
-      qrCodeCache.delete(sessionCode);
+      await redis.del(`qr:${sessionCode}`);
       
       await updateSessionInDB(sessionCode, { 
         status: 'expired',
@@ -340,7 +348,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('ready', async () => {
       console.log(`WhatsApp client ${sessionCode} is ready!`);
-      qrCodeCache.delete(sessionCode);
+      await redis.del(`qr:${sessionCode}`);
       
       await updateSessionInDB(sessionCode, { 
         status: 'connected',
@@ -351,7 +359,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('disconnected', async (reason) => {
       console.log(`WhatsApp client ${sessionCode} disconnected:`, reason);
-      qrCodeCache.delete(sessionCode);
+      await redis.del(`qr:${sessionCode}`);
       
       await updateSessionInDB(sessionCode, { 
         status: 'disconnected',
@@ -375,7 +383,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
   } catch (error) {
     console.error(`Error initializing session ${sessionCode}:`, error);
-    qrCodeCache.delete(sessionCode);
+    await redis.del(`qr:${sessionCode}`);
     
     await updateSessionInDB(sessionCode, { 
       status: 'expired',
@@ -396,11 +404,12 @@ app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
   const userId = req.user.id;
   
   try {
-    // Check memory cache first
-    if (qrCodeCache.has(sessionCode)) {
+    // Check Redis cache first
+    const cachedQR = await redis.get(`qr:${sessionCode}`);
+    if (cachedQR) {
       return res.json({ 
         success: true, 
-        qrCode: qrCodeCache.get(sessionCode)
+        qrCode: cachedQR
       });
     }
 
@@ -728,7 +737,7 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
         console.error(`Error destroying client ${sessionCode}:`, error);
       }
       clients.delete(sessionCode);
-      qrCodeCache.delete(sessionCode);
+      await redis.del(`qr:${sessionCode}`);
     }
     
     // Update session status in database
@@ -747,7 +756,7 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
     
     // Force cleanup
     clients.delete(sessionCode);
-    qrCodeCache.delete(sessionCode);
+    await redis.del(`qr:${sessionCode}`);
     await updateSessionInDB(sessionCode, { 
       status: 'disconnected',
       qr_code: null 
@@ -845,6 +854,7 @@ process.on('SIGTERM', async () => {
     try {
       console.log(`Disconnecting session ${sessionCode}...`);
       await client.destroy();
+      await redis.del(`qr:${sessionCode}`);
       await updateSessionInDB(sessionCode, { 
         status: 'disconnected',
         qr_code: null 
@@ -864,6 +874,7 @@ process.on('SIGINT', async () => {
     try {
       console.log(`Disconnecting session ${sessionCode}...`);
       await client.destroy();
+      await redis.del(`qr:${sessionCode}`);
       await updateSessionInDB(sessionCode, { 
         status: 'disconnected',
         qr_code: null 
@@ -883,6 +894,7 @@ app.listen(PORT, () => {
   console.log(`💾 Sessions directory: ${SESSIONS_DIR}`);
   console.log(`🔗 Health check: http://localhost:${PORT}/health`);
   console.log(`🗄️  Supabase connected: ${!!supabase}`);
+  console.log(`🔴 Redis connected: ${redis.status === 'ready'}`);
 });
 
 module.exports = app;
