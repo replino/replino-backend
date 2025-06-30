@@ -320,8 +320,16 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       }
     });
 
-    client.on('loading_screen', (percent, message) => {
+    client.on('loading_screen', async (percent, message) => {
       console.log(`Loading screen: ${percent}% ${message || ''}`);
+      if (percent === 100) {
+        // QR code has been scanned - clear it
+        await redis.del(`qr:${sessionCode}`);
+        await updateSessionInDB(sessionCode, {
+          qr_code: null,
+          status: 'connecting'
+        });
+      }
     });
 
     client.on('authenticated', async () => {
@@ -330,7 +338,8 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       
       await updateSessionInDB(sessionCode, { 
         status: 'connected',
-        last_connected_at: new Date().toISOString()
+        last_connected_at: new Date().toISOString(),
+        qr_code: null
       });
     });
 
@@ -450,7 +459,6 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
   const userId = req.user.id;
   
   try {
-    // Get session from database
     const sessionData = await getSessionFromDB(sessionCode, userId);
     if (!sessionData) {
       return res.status(404).json({ 
@@ -461,23 +469,33 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
 
     const hasClient = clients.has(sessionCode);
     let actualStatus = sessionData.status;
+    let qrCode = null;
 
-    // If we have a client, check its actual state
     if (hasClient) {
       try {
         const client = clients.get(sessionCode);
         const state = await client.getState();
         
-        if (state === 'CONNECTED' && sessionData.status !== 'connected') {
+        if (state === 'CONNECTED') {
           actualStatus = 'connected';
-          await updateSessionInDB(sessionCode, { 
-            status: 'connected',
-            last_connected_at: new Date().toISOString()
-          });
-        } else if (state !== 'CONNECTED' && sessionData.status === 'connected') {
-          actualStatus = 'disconnected';
-          await updateSessionInDB(sessionCode, { status: 'disconnected' });
+          // Ensure QR code is cleared when connected
+          await redis.del(`qr:${sessionCode}`);
+          qrCode = null;
+        } else if (state === 'QR_SCAN_COMPLETE') {
+          // Special state when QR is scanned but not fully authenticated
+          actualStatus = 'connecting';
+          qrCode = null;
+        } else {
+          // Check if we should show QR code
+          const cachedQR = await redis.get(`qr:${sessionCode}`);
+          qrCode = cachedQR || sessionData.qr_code;
         }
+        
+        await updateSessionInDB(sessionCode, { 
+          status: actualStatus,
+          qr_code: qrCode,
+          last_connected_at: actualStatus === 'connected' ? new Date().toISOString() : sessionData.last_connected_at
+        });
       } catch (error) {
         console.error('Error checking client state:', error);
         actualStatus = 'disconnected';
@@ -490,7 +508,7 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
       status: actualStatus,
       lastConnected: sessionData.last_connected_at,
       hasClient,
-      qrCode: sessionData.qr_code
+      qrCode: actualStatus === 'connected' ? null : qrCode // Never show QR if connected
     });
 
   } catch (error) {
