@@ -20,15 +20,16 @@
   "author": "WhatsApp Bulk Sender",
   "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
+    "@supabase/supabase-js": "^2.39.0",
+    "compression": "^1.7.4",
     "cors": "^2.8.5",
-    "whatsapp-web.js": "^1.23.0",
-    "qrcode": "^1.5.3",
+    "express": "^4.18.2",
     "express-rate-limit": "^7.1.5",
     "helmet": "^7.1.0",
-    "compression": "^1.7.4",
-    "@supabase/supabase-js": "^2.39.0",
-    "jsonwebtoken": "^9.0.2"
+    "ioredis": "^5.6.1",
+    "jsonwebtoken": "^9.0.2",
+    "qrcode": "^1.5.3",
+    "whatsapp-web.js": "^1.23.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
