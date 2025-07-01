@@ -20,17 +20,24 @@
   "author": "WhatsApp Bulk Sender",
   "license": "MIT",
   "dependencies": {
-    "@supabase/supabase-js": "^2.39.0",
-    "compression": "^1.7.4",
+    "@supabase/supabase-js": "^2.50.2",
+    "cluster": "^0.7.7",
+    "compression": "^1.8.0",
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "express-rate-limit": "^7.1.5",
-    "helmet": "^7.1.0",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.1",
+    "fs": "^0.0.1-security",
+    "helmet": "^7.2.0",
     "ioredis": "^5.6.1",
     "jsonwebtoken": "^9.0.2",
-    "qrcode": "^1.5.3",
+    "lodash": "^4.17.21",
+    "os": "^0.1.2",
+    "path": "^0.12.7",
+    "pino": "^9.7.0",
+    "pino-http": "^10.5.0",
+    "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.23.0"
+    "whatsapp-web.js": "^1.31.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
