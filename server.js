@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode');
+const qrcode = require('qrcode-terminal');
 const fs = require('fs').promises;
 const path = require('path');
 const rateLimit = require('express-rate-limit');
@@ -10,47 +10,118 @@ const compression = require('compression');
 const { createClient } = require('@supabase/supabase-js');
 const jwt = require('jsonwebtoken');
 const Redis = require('ioredis');
+const cluster = require('cluster');
+const os = require('os');
+const { throttle } = require('lodash');
+const pino = require('pino');
+const pinoHttp = require('pino-http');
+
+// Initialize logger
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  transport: {
+    target: 'pino-pretty',
+    options: {
+      colorize: true,
+      translateTime: 'SYS:standard',
+      ignore: 'pid,hostname'
+    }
+  }
+});
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Initialize Redis client for Upstash
+// Cluster mode for multi-core utilization
+if (cluster.isMaster && process.env.NODE_ENV === 'production') {
+  const numCPUs = os.cpus().length;
+  logger.info(`Master ${process.pid} is running with ${numCPUs} workers`);
+  
+  // Fork workers
+  for (let i = 0; i < numCPUs; i++) {
+    cluster.fork();
+  }
+  
+  cluster.on('exit', (worker, code, signal) => {
+    logger.error(`Worker ${worker.process.pid} died. Restarting...`);
+    cluster.fork();
+  });
+  
+  return;
+}
+
+// Initialize Redis client with connection pooling
 const redis = new Redis({
-  host: 'clean-panda-53790.upstash.io',
-  port: 6379,
-  password: 'AdIeAAIjcDE3ZDhjZTNlYTRmYWY0YTMxODNhZDc1MDVmZGQwNWVhOXAxMA',
-  tls: {}
+  host: process.env.REDIS_HOST || 'clean-panda-53790.upstash.io',
+  port: process.env.REDIS_PORT || 6379,
+  password: process.env.REDIS_PASSWORD || 'AdIeAAIjcDE3ZDhjZTNlYTRmYWY0YTMxODNhZDc1MDVmZGQwNWVhOXAxMA',
+  tls: {},
+  retryStrategy: (times) => {
+    const delay = Math.min(times * 50, 2000);
+    return delay;
+  },
+  maxRetriesPerRequest: 3
 });
 
-// Initialize Supabase client
+// Initialize Supabase client with connection pooling
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const supabase = createClient(supabaseUrl, supabaseServiceKey);
+const supabase = createClient(supabaseUrl, supabaseServiceKey, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false
+  }
+});
 
 if (!supabaseUrl || !supabaseServiceKey) {
-  console.error('❌ Missing Supabase configuration. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
+  logger.error('❌ Missing Supabase configuration. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
   process.exit(1);
 }
 
+// HTTP logger middleware
+app.use(pinoHttp({ logger }));
+
 // Security and performance middleware
-app.use(helmet());
-app.use(compression());
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'", "https://*.upstash.io", supabaseUrl]
+    }
+  }
+}));
+app.use(compression({
+  level: 6,
+  threshold: '10kb',
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) return false;
+    return compression.filter(req, res);
+  }
+}));
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
     ? (process.env.FRONTEND_URLS ? process.env.FRONTEND_URLS.split(',') : ['https://your-frontend-domain.com'])
     : ['http://localhost:5173', 'http://localhost:3000'],
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400
 }));
 
-// Rate limiting
+// Rate limiting with Redis store
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
+  store: new rateLimit.RedisStore({
+    sendCommand: (...args) => redis.sendCommand(args)
+  })
 });
-app.use(limiter);
 
 // Stricter rate limiting for message sending
 const sendLimiter = rateLimit({
@@ -59,13 +130,32 @@ const sendLimiter = rateLimit({
   message: 'Too many messages sent, please slow down.',
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => `${req.user.id}:${req.params.sessionCode}`,
+  store: new rateLimit.RedisStore({
+    sendCommand: (...args) => redis.sendCommand(args)
+  })
 });
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// In-memory storage for WhatsApp clients
+// In-memory storage for WhatsApp clients with TTL
 const clients = new Map();
+const SESSION_TTL = 30 * 60 * 1000; // 30 minutes
+
+// Session cleanup interval
+setInterval(() => {
+  const now = Date.now();
+  for (const [sessionCode, { lastActivity }] of clients.entries()) {
+    if (now - lastActivity > SESSION_TTL) {
+      logger.info(`Cleaning up inactive session: ${sessionCode}`);
+      const client = clients.get(sessionCode).client;
+      client.destroy().catch(err => logger.error(`Error cleaning up session ${sessionCode}:`, err));
+      clients.delete(sessionCode);
+      redis.del(`qr:${sessionCode}`).catch(err => logger.error('Redis del error:', err));
+    }
+  }
+}, 60 * 1000); // Run every minute
 
 // Ensure sessions directory exists
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
@@ -79,9 +169,9 @@ async function ensureSessionsDir() {
 }
 
 // Initialize sessions directory on startup
-ensureSessionsDir();
+ensureSessionsDir().catch(err => logger.error('Error creating sessions dir:', err));
 
-// Middleware to verify Supabase JWT token
+// Middleware to verify Supabase JWT token with caching
 async function verifyAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
@@ -93,6 +183,16 @@ async function verifyAuth(req, res, next) {
     }
 
     const token = authHeader.substring(7);
+    
+    // Check Redis cache first
+    const cacheKey = `auth:${token}`;
+    const cachedUser = await redis.get(cacheKey);
+    
+    if (cachedUser) {
+      req.user = JSON.parse(cachedUser);
+      return next();
+    }
+
     const { data: { user }, error } = await supabase.auth.getUser(token);
     
     if (error || !user) {
@@ -102,10 +202,12 @@ async function verifyAuth(req, res, next) {
       });
     }
 
+    // Cache valid token for 5 minutes
+    await redis.setex(cacheKey, 300, JSON.stringify(user));
     req.user = user;
     next();
   } catch (error) {
-    console.error('Auth verification error:', error);
+    logger.error('Auth verification error:', error);
     res.status(401).json({ 
       success: false, 
       error: 'Authentication failed' 
@@ -113,9 +215,10 @@ async function verifyAuth(req, res, next) {
   }
 }
 
-// Utility function to update session in database
+// Enhanced session management with caching
 async function updateSessionInDB(sessionCode, updates) {
   try {
+    const cacheKey = `session:${sessionCode}`;
     const { error } = await supabase
       .from('sessions')
       .update({
@@ -125,16 +228,30 @@ async function updateSessionInDB(sessionCode, updates) {
       .eq('session_code', sessionCode);
 
     if (error) {
-      console.error('Error updating session in DB:', error);
+      logger.error('Error updating session in DB:', error);
+      return;
     }
+
+    // Invalidate cache
+    await redis.del(cacheKey);
   } catch (error) {
-    console.error('Database update error:', error);
+    logger.error('Database update error:', error);
   }
 }
 
-// Utility function to get session from database
 async function getSessionFromDB(sessionCode, userId = null) {
   try {
+    const cacheKey = `session:${sessionCode}`;
+    const cachedSession = await redis.get(cacheKey);
+    
+    if (cachedSession) {
+      const session = JSON.parse(cachedSession);
+      if (!userId || session.user_id === userId) {
+        return session;
+      }
+      return null;
+    }
+    
     let query = supabase
       .from('sessions')
       .select('*')
@@ -146,26 +263,28 @@ async function getSessionFromDB(sessionCode, userId = null) {
     
     const { data, error } = await query.single();
     
-    if (error) {
-      console.error('Error fetching session from DB:', error);
+    if (error || !data) {
+      logger.error('Error fetching session from DB:', error);
       return null;
     }
     
+    // Cache session for 5 minutes
+    await redis.setex(cacheKey, 300, JSON.stringify(data));
     return data;
   } catch (error) {
-    console.error('Database fetch error:', error);
+    logger.error('Database fetch error:', error);
     return null;
   }
 }
 
-// Utility function to validate phone number
+// Optimized phone number validation
+const phoneRegex = /^\+[1-9]\d{9,14}$/;
 function validatePhoneNumber(phone) {
+  if (typeof phone !== 'string') return false;
   const cleaned = phone.replace(/[^\d+]/g, '');
-  const phoneRegex = /^\+[1-9]\d{9,14}$/;
   return phoneRegex.test(cleaned);
 }
 
-// Utility function to format phone number for WhatsApp
 function formatPhoneNumber(phone) {
   let formatted = phone.replace(/[^\d+]/g, '');
   if (!formatted.startsWith('+')) {
@@ -181,31 +300,38 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     activeSessions: clients.size,
     uptime: process.uptime(),
+    memory: process.memoryUsage(),
     supabaseConnected: !!supabase,
-    redisConnected: redis.status === 'ready'
+    redisConnected: redis.status === 'ready',
+    workerId: cluster.worker?.id || 'master'
   });
 });
 
 // Get server statistics
 app.get('/stats', verifyAuth, async (req, res) => {
   try {
-    const { count: userSessionsCount } = await supabase
-      .from('sessions')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', req.user.id);
+    const [userSessions, redisInfo] = await Promise.all([
+      supabase
+        .from('sessions')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', req.user.id),
+      redis.info()
+    ]);
 
     const stats = {
       activeSessions: clients.size,
-      userSessions: userSessionsCount || 0,
+      userSessions: userSessions.count || 0,
       uptime: process.uptime(),
       memory: process.memoryUsage(),
       timestamp: new Date().toISOString(),
-      redisStatus: redis.status
+      redisStatus: redis.status,
+      redisMemory: redisInfo.match(/used_memory:\d+/)?.[0] || 'unknown',
+      workerId: cluster.worker?.id || 'master'
     };
     
     res.json(stats);
   } catch (error) {
-    console.error('Error fetching stats:', error);
+    logger.error('Error fetching stats:', error);
     res.status(500).json({ 
       success: false, 
       error: 'Failed to fetch statistics' 
@@ -213,7 +339,7 @@ app.get('/stats', verifyAuth, async (req, res) => {
   }
 });
 
-// Initialize WhatsApp session
+// Initialize WhatsApp session with optimized QR generation
 app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
   const { sessionCode } = req.params;
   const userId = req.user.id;
@@ -230,9 +356,9 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     // Check if session already exists and is connected
     if (clients.has(sessionCode)) {
-      const existingClient = clients.get(sessionCode);
+      const { client } = clients.get(sessionCode);
       try {
-        const state = await existingClient.getState();
+        const state = await client.getState();
         
         if (state === 'CONNECTED') {
           await updateSessionInDB(sessionCode, { 
@@ -249,6 +375,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       } catch (error) {
         // Client exists but not responsive, clean it up
         clients.delete(sessionCode);
+        await redis.del(`qr:${sessionCode}`);
       }
     }
 
@@ -258,7 +385,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       qr_code: null 
     });
 
-    // Create new client with session persistence
+    // Create new client with optimized configuration
     const client = new Client({
       authStrategy: new LocalAuth({
         clientId: sessionCode,
@@ -274,54 +401,72 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
           '--no-first-run',
           '--no-zygote',
           '--single-process',
-          '--disable-gpu'
-        ]
+          '--disable-gpu',
+          '--js-flags="--max-old-space-size=256"'
+        ],
+        executablePath: process.env.CHROME_BIN || undefined
       },
       webVersionCache: {
         type: 'remote',
         remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
       },
-      qrTimeoutMs: 0, // Disable QR timeout
-      takeoverOnConflict: true, // Take over existing session
-      restartOnAuthFail: true // Restart if auth fails
+      qrTimeoutMs: 0,
+      takeoverOnConflict: true,
+      restartOnAuthFail: true,
+      qrMaxRetries: 3
     });
 
-    // Store client
-    clients.set(sessionCode, client);
+    // Store client with last activity timestamp
+    clients.set(sessionCode, { 
+      client, 
+      lastActivity: Date.now() 
+    });
 
-    // Set up event handlers with enhanced logging
-    client.on('qr', async (qr) => {
-      console.log(`QR Code generated for session ${sessionCode}`);
-      console.log(`QR data length: ${qr.length}`);
+    // Throttled QR code handler to prevent excessive updates
+    const handleQR = throttle(async (qr) => {
+      logger.info(`QR Code generated for session ${sessionCode}`);
       
       try {
-        // Generate QR code image immediately
-        const qrCodeImage = await qrcode.toDataURL(qr, {
-          width: 256,
-          margin: 2,
-          color: {
-            dark: '#000000',
-            light: '#FFFFFF'
-          }
+        // Generate QR code directly in terminal and as data URL
+        qrcode.generate(qr, { small: true });
+        
+        const qrCodeImage = await new Promise((resolve) => {
+          qrcode.toDataURL(qr, {
+            width: 256,
+            margin: 2,
+            color: {
+              dark: '#000000',
+              light: '#FFFFFF'
+            }
+          }, (err, url) => {
+            if (err) {
+              logger.error('QR generation error:', err);
+              resolve(null);
+            } else {
+              resolve(url);
+            }
+          });
         });
 
-        // Store in Redis cache for faster access
-        await redis.setex(`qr:${sessionCode}`, 300, qrCodeImage);
+        if (qrCodeImage) {
+          // Store in Redis cache for faster access
+          await redis.setex(`qr:${sessionCode}`, 300, qrCodeImage);
 
-        // Update session with QR code in database
-        await updateSessionInDB(sessionCode, { 
-          status: 'connecting',
-          qr_code: qrCodeImage 
-        });
-
-        console.log(`QR code stored for session ${sessionCode}`);
+          // Update session with QR code in database
+          await updateSessionInDB(sessionCode, { 
+            status: 'connecting',
+            qr_code: qrCodeImage 
+          });
+        }
       } catch (error) {
-        console.error('Error generating QR code:', error);
+        logger.error('Error handling QR code:', error);
       }
-    });
+    }, 5000); // Throttle to once every 5 seconds
+
+    client.on('qr', handleQR);
 
     client.on('loading_screen', async (percent, message) => {
-      console.log(`Loading screen: ${percent}% ${message || ''}`);
+      logger.info(`Loading screen: ${percent}% ${message || ''}`);
       if (percent === 100) {
         // QR code has been scanned - clear it
         await redis.del(`qr:${sessionCode}`);
@@ -333,7 +478,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
     });
 
     client.on('authenticated', async () => {
-      console.log(`WhatsApp client ${sessionCode} authenticated`);
+      logger.info(`WhatsApp client ${sessionCode} authenticated`);
       await redis.del(`qr:${sessionCode}`);
       
       await updateSessionInDB(sessionCode, { 
@@ -344,7 +489,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
     });
 
     client.on('auth_failure', async (msg) => {
-      console.error(`Authentication failed for session ${sessionCode}:`, msg);
+      logger.error(`Authentication failed for session ${sessionCode}:`, msg);
       await redis.del(`qr:${sessionCode}`);
       
       await updateSessionInDB(sessionCode, { 
@@ -356,7 +501,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
     });
 
     client.on('ready', async () => {
-      console.log(`WhatsApp client ${sessionCode} is ready!`);
+      logger.info(`WhatsApp client ${sessionCode} is ready!`);
       await redis.del(`qr:${sessionCode}`);
       
       await updateSessionInDB(sessionCode, { 
@@ -367,7 +512,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
     });
 
     client.on('disconnected', async (reason) => {
-      console.log(`WhatsApp client ${sessionCode} disconnected:`, reason);
+      logger.warn(`WhatsApp client ${sessionCode} disconnected:`, reason);
       await redis.del(`qr:${sessionCode}`);
       
       await updateSessionInDB(sessionCode, { 
@@ -378,10 +523,12 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       clients.delete(sessionCode);
     });
 
-    // Initialize the client
-    console.log(`Initializing WhatsApp client for session ${sessionCode}`);
-    await client.initialize();
-    console.log(`Client initialization started for ${sessionCode}`);
+    // Initialize the client with error handling
+    logger.info(`Initializing WhatsApp client for session ${sessionCode}`);
+    await client.initialize().catch(err => {
+      logger.error(`Client initialization failed for ${sessionCode}:`, err);
+      throw err;
+    });
 
     res.json({ 
       success: true, 
@@ -391,11 +538,11 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
     });
 
   } catch (error) {
-    console.error(`Error initializing session ${sessionCode}:`, error);
+    logger.error(`Error initializing session ${sessionCode}:`, error);
     await redis.del(`qr:${sessionCode}`);
     
     await updateSessionInDB(sessionCode, { 
-      status: 'expired',
+      status: 'error',
       qr_code: null 
     });
     
@@ -444,7 +591,7 @@ app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
     });
 
   } catch (error) {
-    console.error(`Error getting QR code for session ${sessionCode}:`, error);
+    logger.error(`Error getting QR code for session ${sessionCode}:`, error);
     res.status(500).json({ 
       success: false, 
       error: 'Failed to get QR code',
@@ -453,13 +600,17 @@ app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
   }
 });
 
-// Get session status
+// Get session status with optimized checks
 app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
   const { sessionCode } = req.params;
   const userId = req.user.id;
   
   try {
-    const sessionData = await getSessionFromDB(sessionCode, userId);
+    const [sessionData, cachedQR] = await Promise.all([
+      getSessionFromDB(sessionCode, userId),
+      redis.get(`qr:${sessionCode}`)
+    ]);
+
     if (!sessionData) {
       return res.status(404).json({ 
         success: false, 
@@ -469,27 +620,23 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
 
     const hasClient = clients.has(sessionCode);
     let actualStatus = sessionData.status;
-    let qrCode = null;
+    let qrCode = cachedQR || sessionData.qr_code;
 
     if (hasClient) {
       try {
-        const client = clients.get(sessionCode);
+        const { client } = clients.get(sessionCode);
         const state = await client.getState();
         
         if (state === 'CONNECTED') {
           actualStatus = 'connected';
-          // Ensure QR code is cleared when connected
-          await redis.del(`qr:${sessionCode}`);
           qrCode = null;
         } else if (state === 'QR_SCAN_COMPLETE') {
-          // Special state when QR is scanned but not fully authenticated
           actualStatus = 'connecting';
           qrCode = null;
-        } else {
-          // Check if we should show QR code
-          const cachedQR = await redis.get(`qr:${sessionCode}`);
-          qrCode = cachedQR || sessionData.qr_code;
         }
+        
+        // Update last activity
+        clients.get(sessionCode).lastActivity = Date.now();
         
         await updateSessionInDB(sessionCode, { 
           status: actualStatus,
@@ -497,7 +644,7 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
           last_connected_at: actualStatus === 'connected' ? new Date().toISOString() : sessionData.last_connected_at
         });
       } catch (error) {
-        console.error('Error checking client state:', error);
+        logger.error('Error checking client state:', error);
         actualStatus = 'disconnected';
       }
     }
@@ -508,11 +655,11 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
       status: actualStatus,
       lastConnected: sessionData.last_connected_at,
       hasClient,
-      qrCode: actualStatus === 'connected' ? null : qrCode // Never show QR if connected
+      qrCode: actualStatus === 'connected' ? null : qrCode
     });
 
   } catch (error) {
-    console.error(`Error getting status for session ${sessionCode}:`, error);
+    logger.error(`Error getting status for session ${sessionCode}:`, error);
     res.status(500).json({ 
       success: false, 
       error: 'Failed to get session status' 
@@ -520,7 +667,7 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
   }
 });
 
-// Send message to a single contact
+// Send message to a single contact with optimized validation
 app.post('/send/:sessionCode/:number/:message', verifyAuth, sendLimiter, async (req, res) => {
   const { sessionCode, number, message } = req.params;
   const userId = req.user.id;
@@ -535,14 +682,24 @@ app.post('/send/:sessionCode/:number/:message', verifyAuth, sendLimiter, async (
       });
     }
 
-    const client = clients.get(sessionCode);
-    if (!client) {
+    // Validate phone number before checking client
+    if (!validatePhoneNumber(number)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid phone number format' 
+      });
+    }
+
+    const clientData = clients.get(sessionCode);
+    if (!clientData) {
       return res.status(404).json({ 
         success: false, 
         error: 'Session not connected. Please connect first.' 
       });
     }
 
+    const { client } = clientData;
+    
     // Check if client is ready
     const state = await client.getState();
     if (state !== 'CONNECTED') {
@@ -550,14 +707,6 @@ app.post('/send/:sessionCode/:number/:message', verifyAuth, sendLimiter, async (
         success: false, 
         error: 'WhatsApp client is not connected',
         state 
-      });
-    }
-
-    // Validate and format phone number
-    if (!validatePhoneNumber(number)) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Invalid phone number format' 
       });
     }
 
@@ -577,6 +726,7 @@ app.post('/send/:sessionCode/:number/:message', verifyAuth, sendLimiter, async (
     const sentMessage = await client.sendMessage(formattedNumber, decodedMessage);
     
     // Update session last activity
+    clientData.lastActivity = Date.now();
     await updateSessionInDB(sessionCode, { 
       last_connected_at: new Date().toISOString() 
     });
@@ -590,7 +740,7 @@ app.post('/send/:sessionCode/:number/:message', verifyAuth, sendLimiter, async (
     });
 
   } catch (error) {
-    console.error(`Error sending message in session ${sessionCode}:`, error);
+    logger.error(`Error sending message in session ${sessionCode}:`, error);
     res.status(500).json({ 
       success: false, 
       error: 'Failed to send message',
@@ -599,7 +749,7 @@ app.post('/send/:sessionCode/:number/:message', verifyAuth, sendLimiter, async (
   }
 });
 
-// Send bulk messages
+// Optimized bulk message sending with batching
 app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) => {
   const { sessionCode } = req.params;
   const { contacts, message, interval = 5000 } = req.body;
@@ -615,14 +765,16 @@ app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) =>
       });
     }
 
-    const client = clients.get(sessionCode);
-    if (!client) {
+    const clientData = clients.get(sessionCode);
+    if (!clientData) {
       return res.status(404).json({ 
         success: false, 
         error: 'Session not connected. Please connect first.' 
       });
     }
 
+    const { client } = clientData;
+    
     // Check if client is ready
     const state = await client.getState();
     if (state !== 'CONNECTED') {
@@ -647,62 +799,68 @@ app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) =>
       });
     }
 
+    // Process contacts in batches for better performance
+    const BATCH_SIZE = 10;
     const results = [];
-    const maxInterval = Math.max(interval, 3000); // Minimum 3 seconds between messages
+    const maxInterval = Math.max(interval, 3000); // Minimum 3 seconds between batches
     
-    for (let i = 0; i < contacts.length; i++) {
-      const contact = contacts[i];
+    for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
+      const batch = contacts.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.all(batch.map(async (contact) => {
+        try {
+          // Validate phone number
+          if (!validatePhoneNumber(contact.phone)) {
+            return {
+              contact: contact.phone,
+              status: 'failed',
+              error: 'Invalid phone number format'
+            };
+          }
+
+          const formattedNumber = formatPhoneNumber(contact.phone);
+          
+          // Check if number exists on WhatsApp
+          const isRegistered = await client.isRegisteredUser(formattedNumber);
+          if (!isRegistered) {
+            return {
+              contact: contact.phone,
+              status: 'failed',
+              error: 'Number not registered on WhatsApp'
+            };
+          }
+
+          // Send message
+          const sentMessage = await client.sendMessage(
+            formattedNumber, 
+            contact.message || message
+          );
+          
+          return {
+            contact: contact.phone,
+            status: 'sent',
+            messageId: sentMessage.id._serialized,
+            timestamp: new Date().toISOString()
+          };
+        } catch (error) {
+          logger.error(`Error sending to ${contact.phone}:`, error);
+          return {
+            contact: contact.phone,
+            status: 'failed',
+            error: error.message
+          };
+        }
+      }));
+
+      results.push(...batchResults);
       
-      try {
-        // Validate phone number
-        if (!validatePhoneNumber(contact.phone)) {
-          results.push({
-            contact: contact.phone,
-            status: 'failed',
-            error: 'Invalid phone number format'
-          });
-          continue;
-        }
-
-        const formattedNumber = formatPhoneNumber(contact.phone);
-        
-        // Check if number exists on WhatsApp
-        const isRegistered = await client.isRegisteredUser(formattedNumber);
-        if (!isRegistered) {
-          results.push({
-            contact: contact.phone,
-            status: 'failed',
-            error: 'Number not registered on WhatsApp'
-          });
-          continue;
-        }
-
-        // Send message
-        const sentMessage = await client.sendMessage(formattedNumber, contact.message || message);
-        
-        results.push({
-          contact: contact.phone,
-          status: 'sent',
-          messageId: sentMessage.id._serialized,
-          timestamp: new Date().toISOString()
-        });
-
-        // Wait before sending next message (except for the last one)
-        if (i < contacts.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, maxInterval));
-        }
-
-      } catch (error) {
-        console.error(`Error sending to ${contact.phone}:`, error);
-        results.push({
-          contact: contact.phone,
-          status: 'failed',
-          error: error.message
-        });
+      // Wait before sending next batch (except for the last one)
+      if (i + BATCH_SIZE < contacts.length) {
+        await new Promise(resolve => setTimeout(resolve, maxInterval));
       }
     }
 
     // Update session last activity
+    clientData.lastActivity = Date.now();
     await updateSessionInDB(sessionCode, { 
       last_connected_at: new Date().toISOString() 
     });
@@ -721,7 +879,7 @@ app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) =>
     });
 
   } catch (error) {
-    console.error(`Error in bulk send for session ${sessionCode}:`, error);
+    logger.error(`Error in bulk send for session ${sessionCode}:`, error);
     res.status(500).json({ 
       success: false, 
       error: 'Failed to send bulk messages',
@@ -730,7 +888,7 @@ app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) =>
   }
 });
 
-// Disconnect session
+// Disconnect session with cleanup
 app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
   const { sessionCode } = req.params;
   const userId = req.user.id;
@@ -745,14 +903,15 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
       });
     }
 
-    const client = clients.get(sessionCode);
+    const clientData = clients.get(sessionCode);
     
-    if (client) {
+    if (clientData) {
       try {
+        const { client } = clientData;
         await client.logout();
         await client.destroy();
       } catch (error) {
-        console.error(`Error destroying client ${sessionCode}:`, error);
+        logger.error(`Error destroying client ${sessionCode}:`, error);
       }
       clients.delete(sessionCode);
       await redis.del(`qr:${sessionCode}`);
@@ -770,7 +929,7 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
     });
 
   } catch (error) {
-    console.error(`Error disconnecting session ${sessionCode}:`, error);
+    logger.error(`Error disconnecting session ${sessionCode}:`, error);
     
     // Force cleanup
     clients.delete(sessionCode);
@@ -788,7 +947,7 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
   }
 });
 
-// Get user's sessions
+// Get user's sessions with optimized query
 app.get('/sessions', verifyAuth, async (req, res) => {
   const userId = req.user.id;
   
@@ -816,7 +975,7 @@ app.get('/sessions', verifyAuth, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Error fetching user sessions:', error);
+    logger.error('Error fetching user sessions:', error);
     res.status(500).json({ 
       success: false, 
       error: 'Failed to fetch sessions' 
@@ -848,7 +1007,7 @@ app.post('/validate-phone', (req, res) => {
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
+  logger.error('Unhandled error:', error);
   res.status(500).json({ 
     success: false, 
     error: 'Internal server error',
@@ -864,55 +1023,40 @@ app.use((req, res) => {
   });
 });
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully...');
+// Graceful shutdown with cleanup
+async function gracefulShutdown() {
+  logger.info('Shutdown signal received, shutting down gracefully...');
   
-  for (const [sessionCode, client] of clients.entries()) {
-    try {
-      console.log(`Disconnecting session ${sessionCode}...`);
-      await client.destroy();
-      await redis.del(`qr:${sessionCode}`);
-      await updateSessionInDB(sessionCode, { 
-        status: 'disconnected',
-        qr_code: null 
-      });
-    } catch (error) {
-      console.error(`Error disconnecting session ${sessionCode}:`, error);
-    }
+  const cleanupPromises = [];
+  for (const [sessionCode, { client }] of clients.entries()) {
+    cleanupPromises.push(
+      client.destroy()
+        .then(() => redis.del(`qr:${sessionCode}`))
+        .then(() => updateSessionInDB(sessionCode, { 
+          status: 'disconnected',
+          qr_code: null 
+        }))
+        .catch(err => logger.error(`Error disconnecting session ${sessionCode}:`, err))
+    );
   }
   
+  await Promise.allSettled(cleanupPromises);
+  await redis.quit();
   process.exit(0);
-});
+}
 
-process.on('SIGINT', async () => {
-  console.log('SIGINT received, shutting down gracefully...');
-  
-  for (const [sessionCode, client] of clients.entries()) {
-    try {
-      console.log(`Disconnecting session ${sessionCode}...`);
-      await client.destroy();
-      await redis.del(`qr:${sessionCode}`);
-      await updateSessionInDB(sessionCode, { 
-        status: 'disconnected',
-        qr_code: null 
-      });
-    } catch (error) {
-      console.error(`Error disconnecting session ${sessionCode}:`, error);
-    }
-  }
-  
-  process.exit(0);
-});
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 WhatsApp Bulk Sender Backend running on port ${PORT}`);
-  console.log(`📱 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`💾 Sessions directory: ${SESSIONS_DIR}`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
-  console.log(`🗄️  Supabase connected: ${!!supabase}`);
-  console.log(`🔴 Redis connected: ${redis.status === 'ready'}`);
+  logger.info(`🚀 WhatsApp Bulk Sender Backend running on port ${PORT}`);
+  logger.info(`📱 Environment: ${process.env.NODE_ENV || 'development'}`);
+  logger.info(`💾 Sessions directory: ${SESSIONS_DIR}`);
+  logger.info(`🔗 Health check: http://localhost:${PORT}/health`);
+  logger.info(`🗄️  Supabase connected: ${!!supabase}`);
+  logger.info(`🔴 Redis connected: ${redis.status === 'ready'}`);
+  logger.info(`👷 Worker ${cluster.worker?.id || 'master'} started`);
 });
 
 module.exports = app;
