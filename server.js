@@ -14,6 +14,9 @@ const cluster = require('cluster');
 const os = require('os');
 const { Worker } = require('worker_threads');
 const { v4: uuidv4 } = require('uuid');
+const pino = require('pino');
+
+
 
 // Configuration
 const config = {
@@ -414,33 +417,33 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
     });
 
     // Create new client with session persistence
-      const client = new Client({
-        authStrategy: new LocalAuth({
-          clientId: sessionCode,
-          dataPath: config.SESSIONS_DIR,
-          encrypt: true, // Enable session encryption
-          backupSyncIntervalMs: 300000 // 5 minute backup sync
-        }),
-        puppeteer: {
-          ...config.PUPPETEER_CONFIG,
-          timeout: 60000, // 60s timeout for browser launch
-          executablePath: process.env.CHROME_PATH || undefined // Custom Chrome path
-        },
-        webVersionCache: {
-          type: 'remote',
-          remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-          strict: true // Fail if version check fails
-        },
-        qrTimeoutMs: 45000, // 45s timeout (matches WhatsApp's natural expiration)
-        takeoverOnConflict: true,
-        restartOnAuthFail: true,
-        ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg', // For media processing
-        logger: pino({ level: 'warn' }), // Structured logging
-        markOnlineOnConnect: false, // Better for bulk sending
-        connectTimeoutMs: 30000, // 30s connection timeout
-        keepAliveIntervalMs: 25000, // 25s keepalive
-        browserRevision: 'latest' // Auto-update browser
-      });
+        const client = new Client({
+          authStrategy: new LocalAuth({
+            clientId: sessionCode,
+            dataPath: config.SESSIONS_DIR,
+            encrypt: true,
+            backupSyncIntervalMs: 300000
+          }),
+          puppeteer: {
+            ...config.PUPPETEER_CONFIG,
+            timeout: 60000,
+            executablePath: process.env.CHROME_PATH || undefined
+          },
+          webVersionCache: {
+            type: 'remote',
+            remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
+            strict: true
+          },
+          qrTimeoutMs: 45000,
+          takeoverOnConflict: true,
+          restartOnAuthFail: true,
+          ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
+          logger: console, // Simple console logging
+          markOnlineOnConnect: false,
+          connectTimeoutMs: 30000,
+          keepAliveIntervalMs: 25000,
+          browserRevision: 'latest'
+        });
 
     // Store client
     await sessionManager.addClient(sessionCode, client);
