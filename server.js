@@ -17,7 +17,7 @@ const { throttle } = require('lodash');
 const pino = require('pino');
 const pinoHttp = require('pino-http');
 const { Worker } = require('worker_threads');
-const LRU = require('lru-cache');
+const { LRUCache } = require('lru-cache'); // Fixed import
 
 // Initialize logger with production optimizations
 const logger = pino({
@@ -252,10 +252,10 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Enhanced session management with LRU cache for active clients
-const clients = new LRU({
+const clients = new LRUCache({
   max: 5000, // Maximum number of active sessions
   ttl: 30 * 60 * 1000, // 30 minutes TTL
-  dispose: async (sessionCode, client) => {
+  dispose: async (client, sessionCode) => {
     try {
       logger.info(`LRU disposing session: ${sessionCode}`);
       await client.destroy();
@@ -273,16 +273,16 @@ const clients = new LRU({
 // Session cleanup interval
 setInterval(() => {
   const now = Date.now();
-  clients.forEach(async (client, sessionCode) => {
+  for (const [sessionCode, clientData] of clients) {
     try {
-      if (now - client.lastActivity > 30 * 60 * 1000) {
+      if (now - clientData.lastActivity > 30 * 60 * 1000) {
         logger.info(`Cleaning up inactive session: ${sessionCode}`);
         clients.delete(sessionCode);
       }
     } catch (err) {
       logger.error(`Error in session cleanup for ${sessionCode}:`, err);
     }
-  });
+  }
 }, 5 * 60 * 1000); // Run every 5 minutes
 
 // Ensure sessions directory exists
@@ -300,7 +300,7 @@ async function ensureSessionsDir() {
 ensureSessionsDir().catch(err => logger.error('Error creating sessions dir:', err));
 
 // Middleware to verify Supabase JWT token with enhanced caching
-const authCache = new LRU({
+const authCache = new LRUCache({
   max: 10000,
   ttl: 5 * 60 * 1000 // 5 minutes
 });
@@ -358,7 +358,7 @@ async function verifyAuth(req, res, next) {
 }
 
 // Enhanced session management with caching
-const sessionCache = new LRU({
+const sessionCache = new LRUCache({
   max: 10000,
   ttl: 5 * 60 * 1000 // 5 minutes
 });
@@ -442,7 +442,7 @@ async function getSessionFromDB(sessionCode, userId = null) {
 
 // Optimized phone number validation with precompiled regex
 const phoneRegex = /^\+[1-9]\d{9,14}$/;
-const phoneCache = new LRU({
+const phoneCache = new LRUCache({
   max: 100000,
   ttl: 24 * 60 * 60 * 1000 // 24 hours
 });
@@ -1356,9 +1356,9 @@ async function gracefulShutdown() {
 
   // Cleanup all sessions
   const cleanupPromises = [];
-  clients.forEach(({ client }, sessionCode) => {
+  for (const [sessionCode, clientData] of clients) {
     cleanupPromises.push(
-      client.destroy()
+      clientData.client.destroy()
         .then(() => redis.del(`qr:${sessionCode}`))
         .then(() => updateSessionInDB(sessionCode, { 
           status: 'disconnected',
@@ -1366,7 +1366,7 @@ async function gracefulShutdown() {
         }))
         .catch(err => logger.error(`Error disconnecting session ${sessionCode}:`, err))
     );
-  });
+  }
   
   await Promise.allSettled(cleanupPromises);
   await redis.quit();
