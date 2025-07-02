@@ -4,8 +4,8 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs').promises;
 const path = require('path');
-const rateLimit = require('express-rate-limit');
-const RedisStore = require('rate-limit-redis'); // Added this line
+const { rateLimit } = require('express-rate-limit'); // Updated import
+const { RedisStore } = require('rate-limit-redis'); // Updated import
 const helmet = require('helmet');
 const compression = require('compression');
 const { createClient } = require('@supabase/supabase-js');
@@ -112,7 +112,7 @@ app.use(cors({
   maxAge: 86400
 }));
 
-// Rate limiting with Redis store - FIXED IMPLEMENTATION
+// Rate limiting with Redis store - UPDATED IMPLEMENTATION
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
@@ -120,11 +120,11 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   store: new RedisStore({
-    sendCommand: (...args) => redis.sendCommand(args)
+    sendCommand: (...args) => redis.sendCommand(...args)
   })
 });
 
-// Stricter rate limiting for message sending - FIXED IMPLEMENTATION
+// Stricter rate limiting for message sending - UPDATED IMPLEMENTATION
 const sendLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
@@ -133,7 +133,7 @@ const sendLimiter = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req) => `${req.user.id}:${req.params.sessionCode}`,
   store: new RedisStore({
-    sendCommand: (...args) => redis.sendCommand(args)
+    sendCommand: (...args) => redis.sendCommand(...args)
   })
 });
 
