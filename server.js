@@ -50,15 +50,17 @@ const config = {
 const redis = new Redis(config.REDIS_CONFIG);
 
 // Initialize Supabase client
+// Update your Supabase client initialization:
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false
+    }
+  }
 );
-
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('❌ Missing Supabase configuration. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
-  process.exit(1);
-}
 
 // Session management with LRU cache
 class SessionManager {
@@ -137,24 +139,31 @@ app.use(cors({
 
 // Rate limiting
 // Update your rate limiter config to:
+// Remove the global app.set('trust proxy', true)
+
+// Update your rate limiters to:
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 1000,
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
-  validate: { trustProxy: true }  // Explicitly enable proxy validation
+  validate: { 
+    trustProxy: false,
+    xForwardedForHeader: true 
+  }
 });
 
-app.use(limiter);
-
-// Stricter rate limiting for message sending
 const sendLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
   message: 'Too many messages sent, please slow down.',
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { 
+    trustProxy: true,
+    xForwardedForHeader: true 
+  }
 });
 
 app.use(express.json({ limit: '10mb' }));
@@ -405,20 +414,33 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
     });
 
     // Create new client with session persistence
-    const client = new Client({
-      authStrategy: new LocalAuth({
-        clientId: sessionCode,
-        dataPath: config.SESSIONS_DIR
-      }),
-      puppeteer: config.PUPPETEER_CONFIG,
-      webVersionCache: {
-        type: 'remote',
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-      },
-      qrTimeoutMs: 0, // Disable QR timeout
-      takeoverOnConflict: true, // Take over existing session
-      restartOnAuthFail: true // Restart if auth fails
-    });
+      const client = new Client({
+        authStrategy: new LocalAuth({
+          clientId: sessionCode,
+          dataPath: config.SESSIONS_DIR,
+          encrypt: true, // Enable session encryption
+          backupSyncIntervalMs: 300000 // 5 minute backup sync
+        }),
+        puppeteer: {
+          ...config.PUPPETEER_CONFIG,
+          timeout: 60000, // 60s timeout for browser launch
+          executablePath: process.env.CHROME_PATH || undefined // Custom Chrome path
+        },
+        webVersionCache: {
+          type: 'remote',
+          remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
+          strict: true // Fail if version check fails
+        },
+        qrTimeoutMs: 45000, // 45s timeout (matches WhatsApp's natural expiration)
+        takeoverOnConflict: true,
+        restartOnAuthFail: true,
+        ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg', // For media processing
+        logger: pino({ level: 'warn' }), // Structured logging
+        markOnlineOnConnect: false, // Better for bulk sending
+        connectTimeoutMs: 30000, // 30s connection timeout
+        keepAliveIntervalMs: 25000, // 25s keepalive
+        browserRevision: 'latest' // Auto-update browser
+      });
 
     // Store client
     await sessionManager.addClient(sessionCode, client);
