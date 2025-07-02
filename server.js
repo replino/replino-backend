@@ -20,7 +20,7 @@ const config = {
   PORT: process.env.PORT || 3001,
   NODE_ENV: process.env.NODE_ENV || 'development',
   SESSIONS_DIR: path.join(__dirname, 'sessions'),
-  QR_CODE_TTL: 30, // 5 minutes
+  QR_CODE_TTL: 200, // 5 minutes
   MESSAGE_INTERVAL: 3000, // Minimum 3 seconds between messages
   MAX_WORKERS: process.env.MAX_WORKERS || os.cpus().length,
   REDIS_CONFIG: {
@@ -110,6 +110,7 @@ const sessionManager = new SessionManager();
 
 // Initialize Express app
 const app = express();
+app.set('trust proxy', true);  // For Render.com and other proxies
 
 // Security and performance middleware
 app.use(helmet({
@@ -135,13 +136,14 @@ app.use(cors({
 }));
 
 // Rate limiting
+// Update your rate limiter config to:
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
+  windowMs: 15 * 60 * 1000, // 15 minutes
   max: 1000,
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => req.ip === '::ffff:127.0.0.1' // Skip for localhost
+  validate: { trustProxy: true }  // Explicitly enable proxy validation
 });
 
 app.use(limiter);
