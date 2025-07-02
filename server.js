@@ -1,11 +1,11 @@
 const express = require('express');
 const cors = require('cors');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const qrcode = require('qrcode');
 const fs = require('fs').promises;
 const path = require('path');
-const { rateLimit } = require('express-rate-limit'); // Updated import
-const { RedisStore } = require('rate-limit-redis'); // Updated import
+const { rateLimit } = require('express-rate-limit');
+const { RedisStore } = require('rate-limit-redis');
 const helmet = require('helmet');
 const compression = require('compression');
 const { createClient } = require('@supabase/supabase-js');
@@ -16,26 +16,34 @@ const os = require('os');
 const { throttle } = require('lodash');
 const pino = require('pino');
 const pinoHttp = require('pino-http');
+const { Worker } = require('worker_threads');
+const LRU = require('lru-cache');
 
-// Initialize logger
+// Initialize logger with production optimizations
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
-  transport: {
-    target: 'pino-pretty',
-    options: {
-      colorize: true,
-      translateTime: 'SYS:standard',
-      ignore: 'pid,hostname'
+  formatters: {
+    level: (label) => ({ level: label.toUpperCase() }),
+  },
+  timestamp: () => `,"time":"${new Date().toISOString()}"`,
+  ...(process.env.NODE_ENV === 'production' ? {} : {
+    transport: {
+      target: 'pino-pretty',
+      options: {
+        colorize: true,
+        translateTime: 'SYS:standard',
+        ignore: 'pid,hostname'
+      }
     }
-  }
+  })
 });
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Cluster mode for multi-core utilization
+// Enhanced cluster mode with zero-downtime restarts
 if (cluster.isMaster && process.env.NODE_ENV === 'production') {
-  const numCPUs = os.cpus().length;
+  const numCPUs = Math.max(os.cpus().length, 2); // At least 2 workers
   logger.info(`Master ${process.pid} is running with ${numCPUs} workers`);
   
   // Fork workers
@@ -44,33 +52,87 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
   }
   
   cluster.on('exit', (worker, code, signal) => {
-    logger.error(`Worker ${worker.process.pid} died. Restarting...`);
-    cluster.fork();
+    const exitCode = worker.process.exitCode;
+    logger.error(`Worker ${worker.process.pid} died (Code: ${exitCode}, Signal: ${signal}). Restarting...`);
+    const newWorker = cluster.fork();
+    logger.info(`Started new worker ${newWorker.process.pid}`);
+  });
+  
+  // Zero-downtime restarts
+  process.on('SIGUSR2', () => {
+    const workers = Object.values(cluster.workers);
+    
+    const restartWorker = (index) => {
+      if (index >= workers.length) return;
+      
+      const worker = workers[index];
+      logger.info(`Restarting worker ${worker.process.pid}`);
+      
+      worker.once('exit', () => {
+        const newWorker = cluster.fork();
+        newWorker.once('listening', () => {
+          restartWorker(index + 1);
+        });
+      });
+      
+      worker.disconnect();
+    };
+    
+    restartWorker(0);
   });
   
   return;
 }
 
-// Initialize Redis client with connection pooling
-const redis = new Redis({
-  host: process.env.REDIS_HOST || 'clean-panda-53790.upstash.io',
-  port: process.env.REDIS_PORT || 6379,
-  password: process.env.REDIS_PASSWORD || 'AdIeAAIjcDE3ZDhjZTNlYTRmYWY0YTMxODNhZDc1MDVmZGQwNWVhOXAxMA',
-  tls: {},
-  retryStrategy: (times) => {
-    const delay = Math.min(times * 50, 2000);
-    return delay;
-  },
-  maxRetriesPerRequest: 3
+// Enhanced Redis client with connection pooling and failover
+const redis = new Redis.Cluster(
+  process.env.REDIS_CLUSTER_NODES 
+    ? process.env.REDIS_CLUSTER_NODES.split(',').map(node => {
+        const [host, port] = node.split(':');
+        return { host, port: port || 6379 };
+      })
+    : [{
+        host: process.env.REDIS_HOST || 'clean-panda-53790.upstash.io',
+        port: process.env.REDIS_PORT || 6379,
+        password: process.env.REDIS_PASSWORD || 'AdIeAAIjcDE3ZDhjZTNlYTRmYWY0YTMxODNhZDc1MDVmZGQwNWVhOXAxMA',
+        tls: {}
+      }],
+  {
+    scaleReads: 'slave',
+    redisOptions: {
+      maxRetriesPerRequest: 3,
+      retryStrategy: (times) => Math.min(times * 50, 2000),
+      enableOfflineQueue: false,
+      connectTimeout: 10000,
+      commandTimeout: 5000
+    }
+  }
+);
+
+// Redis error handling
+redis.on('error', (err) => {
+  if (err.code === 'ECONNREFUSED') {
+    logger.error('Redis connection refused, please check Redis server');
+  } else {
+    logger.error('Redis error:', err);
+  }
 });
 
-// Initialize Supabase client with connection pooling
+// Initialize Supabase client with enhanced configuration
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const supabase = createClient(supabaseUrl, supabaseServiceKey, {
   auth: {
     persistSession: false,
     autoRefreshToken: false
+  },
+  db: {
+    schema: 'public',
+  },
+  global: {
+    headers: {
+      'X-Client-Info': 'whatsapp-bulk-sender/1.0'
+    }
   }
 });
 
@@ -79,40 +141,80 @@ if (!supabaseUrl || !supabaseServiceKey) {
   process.exit(1);
 }
 
-// HTTP logger middleware
-app.use(pinoHttp({ logger }));
+// HTTP logger middleware with production optimizations
+app.use(pinoHttp({
+  logger,
+  customLogLevel: (res, err) => {
+    if (res.statusCode >= 400 && res.statusCode < 500) {
+      return 'warn';
+    } else if (res.statusCode >= 500 || err) {
+      return 'error';
+    }
+    return 'info';
+  },
+  serializers: {
+    req: (req) => ({
+      method: req.method,
+      url: req.url,
+      hostname: req.hostname,
+      remoteAddress: req.ip,
+      userAgent: req.headers['user-agent']
+    }),
+    res: (res) => ({
+      statusCode: res.statusCode
+    })
+  }
+}));
 
-// Security and performance middleware
+// Security and performance middleware with enhanced CSP
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https:"],
       imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'", "https://*.upstash.io", supabaseUrl]
+      connectSrc: ["'self'", "https://*.upstash.io", supabaseUrl, "wss:"],
+      fontSrc: ["'self'", "https:", "data:"],
+      objectSrc: ["'none'"],
+      upgradeInsecureRequests: []
     }
+  },
+  hsts: {
+    maxAge: 63072000,
+    includeSubDomains: true,
+    preload: true
+  },
+  frameguard: {
+    action: 'deny'
   }
 }));
+
 app.use(compression({
   level: 6,
   threshold: '10kb',
   filter: (req, res) => {
     if (req.headers['x-no-compression']) return false;
     return compression.filter(req, res);
+  },
+  brotli: {
+    enabled: true,
+    zlib: {}
   }
 }));
+
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
     ? (process.env.FRONTEND_URLS ? process.env.FRONTEND_URLS.split(',') : ['https://your-frontend-domain.com'])
     : ['http://localhost:5173', 'http://localhost:3000'],
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  exposedHeaders: ['X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
   maxAge: 86400
 }));
 
-// Rate limiting with Redis store - UPDATED IMPLEMENTATION
+// Enhanced rate limiting with Redis cluster support
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
@@ -120,43 +222,68 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   store: new RedisStore({
-    sendCommand: (...args) => redis.sendCommand(...args)
-  })
+    sendCommand: (...args) => redis.sendCommand(...args),
+    prefix: 'rl:'
+  }),
+  skip: (req) => {
+    // Skip rate limiting for health checks
+    return req.path === '/health';
+  }
 });
 
-// Stricter rate limiting for message sending - UPDATED IMPLEMENTATION
+// Stricter rate limiting for message sending with Redis cluster
 const sendLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
   message: 'Too many messages sent, please slow down.',
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => `${req.user.id}:${req.params.sessionCode}`,
+  keyGenerator: (req) => {
+    const sessionCode = req.params.sessionCode || req.body.sessionCode;
+    return `${req.user.id}:${sessionCode}`;
+  },
   store: new RedisStore({
-    sendCommand: (...args) => redis.sendCommand(...args)
+    sendCommand: (...args) => redis.sendCommand(...args),
+    prefix: 'rl_msg:'
   })
 });
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// In-memory storage for WhatsApp clients with TTL
-const clients = new Map();
-const SESSION_TTL = 30 * 60 * 1000; // 30 minutes
+// Enhanced session management with LRU cache for active clients
+const clients = new LRU({
+  max: 5000, // Maximum number of active sessions
+  ttl: 30 * 60 * 1000, // 30 minutes TTL
+  dispose: async (sessionCode, client) => {
+    try {
+      logger.info(`LRU disposing session: ${sessionCode}`);
+      await client.destroy();
+      await redis.del(`qr:${sessionCode}`);
+      await updateSessionInDB(sessionCode, { 
+        status: 'disconnected',
+        qr_code: null 
+      });
+    } catch (err) {
+      logger.error(`Error disposing session ${sessionCode}:`, err);
+    }
+  }
+});
 
 // Session cleanup interval
 setInterval(() => {
   const now = Date.now();
-  for (const [sessionCode, { lastActivity }] of clients.entries()) {
-    if (now - lastActivity > SESSION_TTL) {
-      logger.info(`Cleaning up inactive session: ${sessionCode}`);
-      const client = clients.get(sessionCode).client;
-      client.destroy().catch(err => logger.error(`Error cleaning up session ${sessionCode}:`, err));
-      clients.delete(sessionCode);
-      redis.del(`qr:${sessionCode}`).catch(err => logger.error('Redis del error:', err));
+  clients.forEach(async (client, sessionCode) => {
+    try {
+      if (now - client.lastActivity > 30 * 60 * 1000) {
+        logger.info(`Cleaning up inactive session: ${sessionCode}`);
+        clients.delete(sessionCode);
+      }
+    } catch (err) {
+      logger.error(`Error in session cleanup for ${sessionCode}:`, err);
     }
-  }
-}, 60 * 1000); // Run every minute
+  });
+}, 5 * 60 * 1000); // Run every 5 minutes
 
 // Ensure sessions directory exists
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
@@ -172,7 +299,12 @@ async function ensureSessionsDir() {
 // Initialize sessions directory on startup
 ensureSessionsDir().catch(err => logger.error('Error creating sessions dir:', err));
 
-// Middleware to verify Supabase JWT token with caching
+// Middleware to verify Supabase JWT token with enhanced caching
+const authCache = new LRU({
+  max: 10000,
+  ttl: 5 * 60 * 1000 // 5 minutes
+});
+
 async function verifyAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
@@ -184,16 +316,24 @@ async function verifyAuth(req, res, next) {
     }
 
     const token = authHeader.substring(7);
-    
-    // Check Redis cache first
     const cacheKey = `auth:${token}`;
-    const cachedUser = await redis.get(cacheKey);
     
-    if (cachedUser) {
-      req.user = JSON.parse(cachedUser);
+    // Check memory cache first
+    if (authCache.has(cacheKey)) {
+      req.user = authCache.get(cacheKey);
       return next();
     }
 
+    // Check Redis cache
+    const cachedUser = await redis.get(cacheKey);
+    if (cachedUser) {
+      const user = JSON.parse(cachedUser);
+      authCache.set(cacheKey, user);
+      req.user = user;
+      return next();
+    }
+
+    // Verify with Supabase
     const { data: { user }, error } = await supabase.auth.getUser(token);
     
     if (error || !user) {
@@ -203,7 +343,8 @@ async function verifyAuth(req, res, next) {
       });
     }
 
-    // Cache valid token for 5 minutes
+    // Cache in both memory and Redis
+    authCache.set(cacheKey, user);
     await redis.setex(cacheKey, 300, JSON.stringify(user));
     req.user = user;
     next();
@@ -217,6 +358,11 @@ async function verifyAuth(req, res, next) {
 }
 
 // Enhanced session management with caching
+const sessionCache = new LRU({
+  max: 10000,
+  ttl: 5 * 60 * 1000 // 5 minutes
+});
+
 async function updateSessionInDB(sessionCode, updates) {
   try {
     const cacheKey = `session:${sessionCode}`;
@@ -230,29 +376,44 @@ async function updateSessionInDB(sessionCode, updates) {
 
     if (error) {
       logger.error('Error updating session in DB:', error);
-      return;
+      return false;
     }
 
-    // Invalidate cache
+    // Invalidate caches
+    sessionCache.delete(cacheKey);
     await redis.del(cacheKey);
+    return true;
   } catch (error) {
     logger.error('Database update error:', error);
+    return false;
   }
 }
 
 async function getSessionFromDB(sessionCode, userId = null) {
   try {
     const cacheKey = `session:${sessionCode}`;
-    const cachedSession = await redis.get(cacheKey);
     
-    if (cachedSession) {
-      const session = JSON.parse(cachedSession);
+    // Check memory cache first
+    if (sessionCache.has(cacheKey)) {
+      const session = sessionCache.get(cacheKey);
       if (!userId || session.user_id === userId) {
         return session;
       }
       return null;
     }
     
+    // Check Redis cache
+    const cachedSession = await redis.get(cacheKey);
+    if (cachedSession) {
+      const session = JSON.parse(cachedSession);
+      sessionCache.set(cacheKey, session);
+      if (!userId || session.user_id === userId) {
+        return session;
+      }
+      return null;
+    }
+    
+    // Query database
     let query = supabase
       .from('sessions')
       .select('*')
@@ -269,7 +430,8 @@ async function getSessionFromDB(sessionCode, userId = null) {
       return null;
     }
     
-    // Cache session for 5 minutes
+    // Cache in both memory and Redis
+    sessionCache.set(cacheKey, data);
     await redis.setex(cacheKey, 300, JSON.stringify(data));
     return data;
   } catch (error) {
@@ -278,12 +440,25 @@ async function getSessionFromDB(sessionCode, userId = null) {
   }
 }
 
-// Optimized phone number validation
+// Optimized phone number validation with precompiled regex
 const phoneRegex = /^\+[1-9]\d{9,14}$/;
+const phoneCache = new LRU({
+  max: 100000,
+  ttl: 24 * 60 * 60 * 1000 // 24 hours
+});
+
 function validatePhoneNumber(phone) {
   if (typeof phone !== 'string') return false;
+  
+  const cacheKey = `phone:${phone}`;
+  if (phoneCache.has(cacheKey)) {
+    return phoneCache.get(cacheKey);
+  }
+  
   const cleaned = phone.replace(/[^\d+]/g, '');
-  return phoneRegex.test(cleaned);
+  const isValid = phoneRegex.test(cleaned);
+  phoneCache.set(cacheKey, isValid);
+  return isValid;
 }
 
 function formatPhoneNumber(phone) {
@@ -294,40 +469,90 @@ function formatPhoneNumber(phone) {
   return formatted.substring(1) + '@c.us';
 }
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
-    timestamp: new Date().toISOString(),
-    activeSessions: clients.size,
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    supabaseConnected: !!supabase,
-    redisConnected: redis.status === 'ready',
-    workerId: cluster.worker?.id || 'master'
-  });
+// Health check endpoint with system diagnostics
+app.get('/health', async (req, res) => {
+  try {
+    const [redisPing, supabasePing, memoryUsage] = await Promise.all([
+      redis.ping().then(() => true).catch(() => false),
+      supabase.rpc('version').then(() => true).catch(() => false),
+      process.memoryUsage()
+    ]);
+    
+    res.json({ 
+      status: 'healthy',
+      system: {
+        platform: process.platform,
+        arch: process.arch,
+        nodeVersion: process.version,
+        memory: {
+          rss: (memoryUsage.rss / 1024 / 1024).toFixed(2) + 'MB',
+          heapTotal: (memoryUsage.heapTotal / 1024 / 1024).toFixed(2) + 'MB',
+          heapUsed: (memoryUsage.heapUsed / 1024 / 1024).toFixed(2) + 'MB',
+          external: (memoryUsage.external / 1024 / 1024).toFixed(2) + 'MB'
+        },
+        cpuUsage: process.cpuUsage(),
+        uptime: process.uptime()
+      },
+      services: {
+        redis: redisPing,
+        supabase: supabasePing,
+        activeSessions: clients.size,
+        workerId: cluster.worker?.id || 'master'
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error('Health check failed:', error);
+    res.status(500).json({ 
+      status: 'unhealthy',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
-// Get server statistics
+// Get server statistics with enhanced metrics
 app.get('/stats', verifyAuth, async (req, res) => {
   try {
-    const [userSessions, redisInfo] = await Promise.all([
+    const [userSessions, redisInfo, systemStats] = await Promise.all([
       supabase
         .from('sessions')
-        .select('*', { count: 'exact', head: true })
+        .select('status, created_at', { count: 'exact', head: true })
         .eq('user_id', req.user.id),
-      redis.info()
+      redis.info(),
+      {
+        memory: process.memoryUsage(),
+        cpu: process.cpuUsage(),
+        uptime: process.uptime(),
+        loadavg: os.loadavg()
+      }
     ]);
 
     const stats = {
-      activeSessions: clients.size,
-      userSessions: userSessions.count || 0,
-      uptime: process.uptime(),
-      memory: process.memoryUsage(),
-      timestamp: new Date().toISOString(),
-      redisStatus: redis.status,
-      redisMemory: redisInfo.match(/used_memory:\d+/)?.[0] || 'unknown',
-      workerId: cluster.worker?.id || 'master'
+      user: {
+        id: req.user.id,
+        sessions: userSessions.count || 0
+      },
+      system: {
+        activeSessions: clients.size,
+        memory: {
+          rss: (systemStats.memory.rss / 1024 / 1024).toFixed(2) + 'MB',
+          heapUsed: (systemStats.memory.heapUsed / 1024 / 1024).toFixed(2) + 'MB'
+        },
+        cpu: {
+          user: systemStats.cpu.user / 1000 + 'ms',
+          system: systemStats.cpu.system / 1000 + 'ms'
+        },
+        load: systemStats.loadavg.map(v => v.toFixed(2)),
+        uptime: systemStats.uptime
+      },
+      redis: {
+        status: redis.status,
+        memory: redisInfo.match(/used_memory:\d+/)?.[0] || 'unknown',
+        connections: redisInfo.match(/connected_clients:\d+/)?.[0] || 'unknown'
+      },
+      worker: cluster.worker?.id || 'master',
+      timestamp: new Date().toISOString()
     };
     
     res.json(stats);
@@ -340,8 +565,35 @@ app.get('/stats', verifyAuth, async (req, res) => {
   }
 });
 
+// QR code generation worker pool
+const QR_WORKER_PATH = path.join(__dirname, 'qr-worker.js');
+const qrWorkers = new Map();
+
+function getQRWorker() {
+  if (!qrWorkers.has(cluster.worker?.id || 'master')) {
+    const worker = new Worker(QR_WORKER_PATH, {
+      workerData: { workerId: cluster.worker?.id || 'master' }
+    });
+    
+    worker.on('error', (err) => {
+      logger.error(`QR Worker error: ${err.message}`);
+    });
+    
+    worker.on('exit', (code) => {
+      if (code !== 0) {
+        logger.error(`QR Worker stopped with exit code ${code}`);
+        qrWorkers.delete(cluster.worker?.id || 'master');
+      }
+    });
+    
+    qrWorkers.set(cluster.worker?.id || 'master', worker);
+  }
+  
+  return qrWorkers.get(cluster.worker?.id || 'master');
+}
+
 // Initialize WhatsApp session with optimized QR generation
-app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
+app.post('/init/:sessionCode', verifyAuth, limiter, async (req, res) => {
   const { sessionCode } = req.params;
   const userId = req.user.id;
   
@@ -357,7 +609,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     // Check if session already exists and is connected
     if (clients.has(sessionCode)) {
-      const { client } = clients.get(sessionCode);
+      const client = clients.get(sessionCode).client;
       try {
         const state = await client.getState();
         
@@ -423,29 +675,30 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       lastActivity: Date.now() 
     });
 
-    // Throttled QR code handler to prevent excessive updates
+    // Throttled QR code handler using worker thread
     const handleQR = throttle(async (qr) => {
       logger.info(`QR Code generated for session ${sessionCode}`);
       
       try {
-        // Generate QR code directly in terminal and as data URL
-        qrcode.generate(qr, { small: true });
-        
-        const qrCodeImage = await new Promise((resolve) => {
-          qrcode.toDataURL(qr, {
-            width: 256,
-            margin: 2,
-            color: {
-              dark: '#000000',
-              light: '#FFFFFF'
+        // Generate QR code in worker thread
+        const worker = getQRWorker();
+        const qrCodeImage = await new Promise((resolve, reject) => {
+          const messageHandler = (message) => {
+            if (message.sessionCode === sessionCode) {
+              worker.off('message', messageHandler);
+              if (message.error) {
+                reject(new Error(message.error));
+              } else {
+                resolve(message.qrCode);
+              }
             }
-          }, (err, url) => {
-            if (err) {
-              logger.error('QR generation error:', err);
-              resolve(null);
-            } else {
-              resolve(url);
-            }
+          };
+          
+          worker.on('message', messageHandler);
+          worker.postMessage({ 
+            qr, 
+            sessionCode,
+            workerId: cluster.worker?.id || 'master'
           });
         });
 
@@ -555,8 +808,8 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
   }
 });
 
-// Get QR code for session
-app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
+// Get QR code for session with caching
+app.get('/qrcode/:sessionCode', verifyAuth, limiter, async (req, res) => {
   const { sessionCode } = req.params;
   const userId = req.user.id;
   
@@ -586,6 +839,9 @@ app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
       });
     }
 
+    // Cache in Redis
+    await redis.setex(`qr:${sessionCode}`, 300, sessionData.qr_code);
+
     res.json({ 
       success: true, 
       qrCode: sessionData.qr_code 
@@ -602,7 +858,7 @@ app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
 });
 
 // Get session status with optimized checks
-app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
+app.get('/status/:sessionCode', verifyAuth, limiter, async (req, res) => {
   const { sessionCode } = req.params;
   const userId = req.user.id;
   
@@ -750,7 +1006,7 @@ app.post('/send/:sessionCode/:number/:message', verifyAuth, sendLimiter, async (
   }
 });
 
-// Optimized bulk message sending with batching
+// Optimized bulk message sending with batching and progress tracking
 app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) => {
   const { sessionCode } = req.params;
   const { contacts, message, interval = 5000 } = req.body;
@@ -800,90 +1056,154 @@ app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) =>
       });
     }
 
-    // Process contacts in batches for better performance
-    const BATCH_SIZE = 10;
-    const results = [];
-    const maxInterval = Math.max(interval, 3000); // Minimum 3 seconds between batches
-    
-    for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
-      const batch = contacts.slice(i, i + BATCH_SIZE);
-      const batchResults = await Promise.all(batch.map(async (contact) => {
-        try {
-          // Validate phone number
-          if (!validatePhoneNumber(contact.phone)) {
-            return {
-              contact: contact.phone,
-              status: 'failed',
-              error: 'Invalid phone number format'
-            };
-          }
+    // Create a progress tracker in Redis
+    const progressKey = `bulk:${sessionCode}:${Date.now()}`;
+    await redis.set(progressKey, JSON.stringify({
+      total: contacts.length,
+      completed: 0,
+      failed: 0,
+      startedAt: new Date().toISOString()
+    }));
 
-          const formattedNumber = formatPhoneNumber(contact.phone);
-          
-          // Check if number exists on WhatsApp
-          const isRegistered = await client.isRegisteredUser(formattedNumber);
-          if (!isRegistered) {
-            return {
-              contact: contact.phone,
-              status: 'failed',
-              error: 'Number not registered on WhatsApp'
-            };
-          }
+    // Start processing in background
+    processBulkMessages(client, contacts, message, interval, progressKey, sessionCode)
+      .catch(err => logger.error(`Bulk send error for ${progressKey}:`, err));
 
-          // Send message
-          const sentMessage = await client.sendMessage(
-            formattedNumber, 
-            contact.message || message
-          );
-          
-          return {
-            contact: contact.phone,
-            status: 'sent',
-            messageId: sentMessage.id._serialized,
-            timestamp: new Date().toISOString()
-          };
-        } catch (error) {
-          logger.error(`Error sending to ${contact.phone}:`, error);
-          return {
-            contact: contact.phone,
-            status: 'failed',
-            error: error.message
-          };
-        }
-      }));
-
-      results.push(...batchResults);
-      
-      // Wait before sending next batch (except for the last one)
-      if (i + BATCH_SIZE < contacts.length) {
-        await new Promise(resolve => setTimeout(resolve, maxInterval));
-      }
-    }
-
-    // Update session last activity
-    clientData.lastActivity = Date.now();
-    await updateSessionInDB(sessionCode, { 
-      last_connected_at: new Date().toISOString() 
-    });
-    
-    const successCount = results.filter(r => r.status === 'sent').length;
-    const failedCount = results.filter(r => r.status === 'failed').length;
-    
     res.json({ 
       success: true,
-      summary: {
-        total: contacts.length,
-        sent: successCount,
-        failed: failedCount
-      },
-      results
+      message: 'Bulk send started',
+      progressKey,
+      total: contacts.length,
+      startedAt: new Date().toISOString()
     });
 
   } catch (error) {
-    logger.error(`Error in bulk send for session ${sessionCode}:`, error);
+    logger.error(`Error starting bulk send for session ${sessionCode}:`, error);
     res.status(500).json({ 
       success: false, 
-      error: 'Failed to send bulk messages',
+      error: 'Failed to start bulk messages',
+      details: error.message 
+    });
+  }
+});
+
+// Background bulk message processing
+async function processBulkMessages(client, contacts, message, interval, progressKey, sessionCode) {
+  const BATCH_SIZE = 10;
+  const maxInterval = Math.max(interval, 3000); // Minimum 3 seconds between batches
+  const results = [];
+  
+  for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
+    const batch = contacts.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(batch.map(async (contact) => {
+      try {
+        // Validate phone number
+        if (!validatePhoneNumber(contact.phone)) {
+          return {
+            contact: contact.phone,
+            status: 'failed',
+            error: 'Invalid phone number format'
+          };
+        }
+
+        const formattedNumber = formatPhoneNumber(contact.phone);
+        
+        // Check if number exists on WhatsApp
+        const isRegistered = await client.isRegisteredUser(formattedNumber);
+        if (!isRegistered) {
+          return {
+            contact: contact.phone,
+            status: 'failed',
+            error: 'Number not registered on WhatsApp'
+          };
+        }
+
+        // Send message
+        const sentMessage = await client.sendMessage(
+          formattedNumber, 
+          contact.message || message
+        );
+        
+        return {
+          contact: contact.phone,
+          status: 'sent',
+          messageId: sentMessage.id._serialized,
+          timestamp: new Date().toISOString()
+        };
+      } catch (error) {
+        logger.error(`Error sending to ${contact.phone}:`, error);
+        return {
+          contact: contact.phone,
+          status: 'failed',
+          error: error.message
+        };
+      }
+    }));
+
+    results.push(...batchResults);
+    
+    // Update progress
+    const completed = results.length;
+    const failed = results.filter(r => r.status === 'failed').length;
+    
+    await redis.set(progressKey, JSON.stringify({
+      total: contacts.length,
+      completed,
+      failed,
+      startedAt: new Date().toISOString(),
+      lastUpdated: new Date().toISOString()
+    }));
+    
+    // Wait before sending next batch (except for the last one)
+    if (i + BATCH_SIZE < contacts.length) {
+      await new Promise(resolve => setTimeout(resolve, maxInterval));
+    }
+  }
+
+  // Final update
+  const failed = results.filter(r => r.status === 'failed').length;
+  await redis.setex(progressKey, 3600, JSON.stringify({
+    total: contacts.length,
+    completed: results.length,
+    failed,
+    startedAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+    status: 'completed',
+    results
+  }));
+
+  // Update session last activity
+  if (clients.has(sessionCode)) {
+    clients.get(sessionCode).lastActivity = Date.now();
+    await updateSessionInDB(sessionCode, { 
+      last_connected_at: new Date().toISOString() 
+    });
+  }
+}
+
+// Get bulk send progress
+app.get('/bulk-progress/:progressKey', verifyAuth, async (req, res) => {
+  const { progressKey } = req.params;
+  
+  try {
+    const progressData = await redis.get(progressKey);
+    if (!progressData) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Progress data not found or expired' 
+      });
+    }
+    
+    const progress = JSON.parse(progressData);
+    res.json({ 
+      success: true,
+      ...progress
+    });
+  } catch (error) {
+    logger.error(`Error getting progress for ${progressKey}:`, error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to get progress',
       details: error.message 
     });
   }
@@ -1028,8 +1348,15 @@ app.use((req, res) => {
 async function gracefulShutdown() {
   logger.info('Shutdown signal received, shutting down gracefully...');
   
+  // Close QR workers
+  qrWorkers.forEach(worker => {
+    worker.postMessage({ command: 'shutdown' });
+    worker.terminate();
+  });
+
+  // Cleanup all sessions
   const cleanupPromises = [];
-  for (const [sessionCode, { client }] of clients.entries()) {
+  clients.forEach(({ client }, sessionCode) => {
     cleanupPromises.push(
       client.destroy()
         .then(() => redis.del(`qr:${sessionCode}`))
@@ -1039,7 +1366,7 @@ async function gracefulShutdown() {
         }))
         .catch(err => logger.error(`Error disconnecting session ${sessionCode}:`, err))
     );
-  }
+  });
   
   await Promise.allSettled(cleanupPromises);
   await redis.quit();
