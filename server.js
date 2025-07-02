@@ -20,7 +20,7 @@ const config = {
   PORT: process.env.PORT || 3001,
   NODE_ENV: process.env.NODE_ENV || 'development',
   SESSIONS_DIR: path.join(__dirname, 'sessions'),
-  QR_CODE_TTL: 300, // 5 minutes
+  QR_CODE_TTL: 30, // 5 minutes
   MESSAGE_INTERVAL: 3000, // Minimum 3 seconds between messages
   MAX_WORKERS: process.env.MAX_WORKERS || os.cpus().length,
   REDIS_CONFIG: {
