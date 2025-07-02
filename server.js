@@ -432,7 +432,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
           webVersionCache: {
             type: 'remote',
             remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-            strict: true
+            strict: false // Set to false to prevent version errors
           },
           qrTimeoutMs: 45000,
           takeoverOnConflict: true,
