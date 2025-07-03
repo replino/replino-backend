@@ -30,9 +30,19 @@ const config = {
     port: parseInt(process.env.REDIS_PORT || '6379', 10),
     password: process.env.REDIS_PASSWORD || 'AdIeAAIjcDE3ZDhjZTNlYTRmYWY0YTMxODNhZDc1MDVmZGQwNWVhOXAxMA',
     tls: process.env.REDIS_TLS === 'true' ? {} : undefined,
-    connectTimeout: 10000,
-    maxRetriesPerRequest: 1
+  connectTimeout: 30000, // Increased from 10s to 30s
+  maxRetriesPerRequest: 3, // Increased from 1
+  retryStrategy: (times) => {
+    const delay = Math.min(times * 1000, 5000); // Exponential backoff up to 5s
+    return delay;
   },
+  keepAlive: 10000, // Send keepalive every 10s
+  reconnectOnError: (err) => {
+    // Reconnect on these errors
+    const targetErrors = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED'];
+    return targetErrors.some(code => err.message.includes(code));
+  }
+},
   PUPPETEER_CONFIG: {
     headless: process.env.PUPPETEER_HEADLESS !== 'false',
     args: [
