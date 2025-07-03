@@ -14,6 +14,9 @@ const Redis = require('ioredis');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Configure Express to trust proxies
+app.set('trust proxy', process.env.NODE_ENV === 'production' ? true : false);
+
 // Initialize Redis client for Upstash
 const redis = new Redis({
   host: 'clean-panda-53790.upstash.io',
@@ -49,6 +52,7 @@ const limiter = rateLimit({
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { trustProxy: true } // Explicitly enable trust proxy for rate limiter
 });
 app.use(limiter);
 
@@ -59,6 +63,7 @@ const sendLimiter = rateLimit({
   message: 'Too many messages sent, please slow down.',
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { trustProxy: true } // Explicitly enable trust proxy for rate limiter
 });
 
 app.use(express.json({ limit: '10mb' }));
