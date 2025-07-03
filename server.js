@@ -20,11 +20,41 @@ const PORT = process.env.PORT || 3001;
 app.set('trust proxy', process.env.NODE_ENV === 'production' ? true : false);
 
 // Initialize Redis client
+// Update your Redis client initialization
 const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
   port: process.env.REDIS_PORT || 6379,
   password: process.env.REDIS_PASSWORD,
-  tls: process.env.REDIS_TLS === 'true' ? {} : undefined
+  tls: process.env.REDIS_TLS === 'true' ? {} : undefined,
+  retryStrategy: (times) => {
+    const delay = Math.min(times * 50, 2000);
+    return delay;
+  },
+  maxRetriesPerRequest: 3,
+  enableOfflineQueue: false // Disable queuing commands when offline
+});
+
+// Add error handling
+redis.on('error', (error) => {
+  console.error('Redis error:', error.message);
+  // Implement your error handling logic here
+  // For example, switch to in-memory cache or notify admins
+});
+
+redis.on('connect', () => {
+  console.log('Connected to Redis server');
+});
+
+redis.on('ready', () => {
+  console.log('Redis client is ready to use');
+});
+
+redis.on('reconnecting', () => {
+  console.log('Reconnecting to Redis...');
+});
+
+redis.on('end', () => {
+  console.log('Redis connection closed');
 });
 
 // Initialize Supabase client
@@ -122,6 +152,7 @@ async function verifyAuth(req, res, next) {
 // Utility functions
 async function updateSessionInDB(sessionCode, updates) {
   try {
+    // First try to update in database
     const { error } = await supabase
       .from('sessions')
       .update({
@@ -131,6 +162,19 @@ async function updateSessionInDB(sessionCode, updates) {
       .eq('session_code', sessionCode);
 
     if (error) throw error;
+    
+    // Then try to update Redis cache if available
+    try {
+      if (redis.status === 'ready') {
+        if (updates.qr_code) {
+          await redis.setex(`qr:${sessionCode}`, 300, updates.qr_code);
+        } else if (updates.status === 'connected') {
+          await redis.del(`qr:${sessionCode}`);
+        }
+      }
+    } catch (redisError) {
+      console.error('Redis update failed, continuing without cache:', redisError.message);
+    }
   } catch (error) {
     console.error('Database update error:', error);
     throw error;
@@ -426,6 +470,24 @@ app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
     });
   }
 });
+
+app.get('/health', async (req, res) => {
+  const redisStatus = redis.status;
+  const redisHealthy = redisStatus === 'ready';
+  
+  res.json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    activeSessions: clients.size,
+    uptime: process.uptime(),
+    redis: {
+      status: redisStatus,
+      healthy: redisHealthy
+    },
+    supabaseConnected: !!supabase
+  });
+});
+
 
 // Get session status
 app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
