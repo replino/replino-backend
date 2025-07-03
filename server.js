@@ -30,19 +30,29 @@ const config = {
     port: parseInt(process.env.REDIS_PORT || '6379', 10),
     password: process.env.REDIS_PASSWORD || 'AdIeAAIjcDE3ZDhjZTNlYTRmYWY0YTMxODNhZDc1MDVmZGQwNWVhOXAxMA',
     tls: process.env.REDIS_TLS === 'true' ? {} : undefined,
-  connectTimeout: 30000, // Increased from 10s to 30s
-  maxRetriesPerRequest: 3, // Increased from 1
-  retryStrategy: (times) => {
-    const delay = Math.min(times * 1000, 5000); // Exponential backoff up to 5s
-    return delay;
+    connectTimeout: 30000, // Increased from 10s to 30s
+    maxRetriesPerRequest: 5, // Increased from 3 to 5
+    retryStrategy: (times) => {
+      const delay = Math.min(times * 1000, 10000); // Exponential backoff up to 10s
+      return delay;
+    },
+    reconnectOnError: (err) => {
+      // Reconnect on these errors
+      const targetErrors = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH'];
+      if (targetErrors.some(code => err.message.includes(code))) {
+        logger.warn(`Reconnecting due to error: ${err.message}`);
+        return 1000; // Reconnect after 1 second
+      }
+      return null;
+    },
+    commandTimeout: 5000, // Wait 5 seconds before failing a command
+    enableOfflineQueue: true, // Queue commands when Redis is offline
+    enableReadyCheck: true, // Wait for ready state before executing commands
+    autoResendUnfulfilledCommands: true, // Resend unfulfilled commands on reconnect
+    maxLoadingRetryTime: 10000, // Max time to wait when Redis is loading
+    keepAlive: 5000, // Send keepalive every 5s
+    family: 4 // Force IPv4 to avoid DNS issues
   },
-  keepAlive: 10000, // Send keepalive every 10s
-  reconnectOnError: (err) => {
-    // Reconnect on these errors
-    const targetErrors = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED'];
-    return targetErrors.some(code => err.message.includes(code));
-  }
-},
   PUPPETEER_CONFIG: {
     headless: process.env.PUPPETEER_HEADLESS !== 'false',
     args: [
@@ -70,11 +80,21 @@ if (isNaN(config.MAX_MESSAGES_PER_MINUTE)) throw new Error('Invalid MAX_MESSAGES
 
 // Initialize Redis with enhanced error handling and connection pooling
 const redis = new Redis(config.REDIS_CONFIG);
-redis.on('error', (err) => console.error('Redis error:', err));
-redis.on('connect', () => console.log('Redis connected'));
-redis.on('ready', () => console.log('Redis ready'));
-redis.on('close', () => console.log('Redis connection closed'));
-redis.on('reconnecting', () => console.log('Redis reconnecting'));
+
+// Enhanced Redis event handlers with better logging
+redis.on('error', (err) => {
+  if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT') {
+    logger.warn(`Redis connection error (retrying): ${err.message}`);
+  } else {
+    logger.error(`Redis error: ${err.message}`, { stack: err.stack });
+  }
+});
+
+redis.on('connect', () => logger.info('Redis connected'));
+redis.on('ready', () => logger.info('Redis ready for commands'));
+redis.on('close', () => logger.warn('Redis connection closed'));
+redis.on('reconnecting', (delay) => logger.warn(`Redis reconnecting in ${delay}ms`));
+redis.on('end', () => logger.warn('Redis connection ended (no more reconnections)'));
 
 // Initialize Supabase client with enhanced configuration
 const supabase = createClient(
@@ -101,6 +121,40 @@ const logger = pino({
     }
   }
 });
+
+// Redis connection health check
+async function checkRedisConnection() {
+  try {
+    await redis.ping();
+    return true;
+  } catch (error) {
+    logger.error('Redis connection check failed:', error);
+    return false;
+  }
+}
+
+// Redis command wrapper with retry logic
+async function redisCommand(command, ...args) {
+  const maxRetries = 3;
+  let lastError;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      if (!redis || redis.status !== 'ready') {
+        throw new Error('Redis connection not ready');
+      }
+      return await redis[command](...args);
+    } catch (error) {
+      lastError = error;
+      logger.warn(`Redis command ${command} attempt ${attempt} failed: ${error.message}`);
+      if (attempt < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, attempt * 500));
+      }
+    }
+  }
+  
+  throw lastError || new Error(`Redis command ${command} failed after ${maxRetries} attempts`);
+}
 
 // Session management with enhanced error handling and cleanup
 class SessionManager {
@@ -517,7 +571,7 @@ app.get('/stats', verifyAuth, async (req, res) => {
       .select('*', { count: 'exact', head: true })
       .eq('user_id', req.user.id);
 
-    const redisInfo = await redis.info();
+    const redisInfo = await redisCommand('info');
     const memoryUsage = process.memoryUsage();
     const systemMemory = {
       total: os.totalmem(),
@@ -629,7 +683,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       try {
         const qrCodeImage = await QRWorkerPool.generate(qr);
         
-        await redis.setex(`qr:${sessionCode}`, config.QR_CODE_TTL, qrCodeImage);
+        await redisCommand('setex', `qr:${sessionCode}`, config.QR_CODE_TTL, qrCodeImage);
         await updateSessionInDB(sessionCode, { 
           status: 'connecting',
           qr_code: qrCodeImage 
@@ -644,7 +698,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
     client.on('loading_screen', async (percent, message) => {
       logger.debug(`Loading screen: ${percent}% ${message || ''}`);
       if (percent === 100) {
-        await redis.del(`qr:${sessionCode}`);
+        await redisCommand('del', `qr:${sessionCode}`);
         await updateSessionInDB(sessionCode, {
           qr_code: null,
           status: 'connecting'
@@ -654,7 +708,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('authenticated', async () => {
       logger.info(`WhatsApp client ${sessionCode} authenticated`);
-      await redis.del(`qr:${sessionCode}`);
+      await redisCommand('del', `qr:${sessionCode}`);
       await updateSessionInDB(sessionCode, { 
         status: 'connected',
         last_connected_at: new Date().toISOString(),
@@ -664,7 +718,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('auth_failure', async (msg) => {
       logger.error(`Authentication failed for session ${sessionCode}:`, msg);
-      await redis.del(`qr:${sessionCode}`);
+      await redisCommand('del', `qr:${sessionCode}`);
       await updateSessionInDB(sessionCode, { 
         status: 'expired',
         qr_code: null 
@@ -674,7 +728,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('ready', async () => {
       logger.info(`WhatsApp client ${sessionCode} is ready!`);
-      await redis.del(`qr:${sessionCode}`);
+      await redisCommand('del', `qr:${sessionCode}`);
       await updateSessionInDB(sessionCode, { 
         status: 'connected',
         last_connected_at: new Date().toISOString(),
@@ -684,7 +738,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('disconnected', async (reason) => {
       logger.warn(`WhatsApp client ${sessionCode} disconnected:`, reason);
-      await redis.del(`qr:${sessionCode}`);
+      await redisCommand('del', `qr:${sessionCode}`);
       await updateSessionInDB(sessionCode, { 
         status: 'disconnected',
         qr_code: null 
@@ -730,7 +784,7 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
   } catch (error) {
     logger.error(`Error initializing session ${sessionCode}:`, error);
-    await redis.del(`qr:${sessionCode}`);
+    await redisCommand('del', `qr:${sessionCode}`);
     await sessionManager.removeClient(sessionCode);
     await updateSessionInDB(sessionCode, { 
       status: 'failed',
@@ -752,7 +806,7 @@ app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
   
   try {
     // Check Redis cache first
-    const cachedQR = await redis.get(`qr:${sessionCode}`);
+    const cachedQR = await redisCommand('get', `qr:${sessionCode}`);
     if (cachedQR) {
       return res.json({ 
         success: true, 
@@ -778,7 +832,7 @@ app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
     }
 
     // Cache the QR code from DB in Redis
-    await redis.setex(`qr:${sessionCode}`, config.QR_CODE_TTL, sessionData.qr_code);
+    await redisCommand('setex', `qr:${sessionCode}`, config.QR_CODE_TTL, sessionData.qr_code);
     
     res.json({ 
       success: true, 
@@ -821,13 +875,13 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
         
         if (state === 'CONNECTED') {
           actualStatus = 'connected';
-          await redis.del(`qr:${sessionCode}`);
+          await redisCommand('del', `qr:${sessionCode}`);
           qrCode = null;
         } else if (state === 'QR_SCAN_COMPLETE') {
           actualStatus = 'connecting';
           qrCode = null;
         } else {
-          const cachedQR = await redis.get(`qr:${sessionCode}`);
+          const cachedQR = await redisCommand('get', `qr:${sessionCode}`);
           qrCode = cachedQR || sessionData.qr_code;
         }
         
@@ -1047,7 +1101,7 @@ app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) =>
     const batchId = uuidv4();
     
     // Store initial batch info in Redis
-    await redis.hset(`batch:${batchId}`, {
+    await redisCommand('hset', `batch:${batchId}`, {
       userId,
       sessionCode,
       total: contacts.length,
@@ -1057,7 +1111,7 @@ app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) =>
     });
 
     // Set expiration (24 hours)
-    await redis.expire(`batch:${batchId}`, 86400);
+    await redisCommand('expire', `batch:${batchId}`, 86400);
     
     // Immediately respond that processing has started
     res.json({ 
@@ -1071,7 +1125,7 @@ app.post('/send-bulk/:sessionCode', verifyAuth, sendLimiter, async (req, res) =>
     processBulkMessages(client, sessionCode, contacts, message, interval, batchId)
       .catch(error => {
         logger.error(`Error processing batch ${batchId}:`, error);
-        redis.hset(`batch:${batchId}`, {
+        redisCommand('hset', `batch:${batchId}`, {
           status: 'failed',
           error: error.message
         });
@@ -1132,13 +1186,13 @@ async function processBulkMessages(client, sessionCode, contacts, message, inter
       });
 
       // Store progress in Redis
-      await redis.hset(`batch:${batchId}`, {
+      await redisCommand('hset', `batch:${batchId}`, {
         progress: i + 1,
         lastUpdated: new Date().toISOString()
       });
 
       // Store detailed results incrementally
-      await redis.setex(`batch:results:${batchId}:${i}`, 86400, JSON.stringify(results[i]));
+      await redisCommand('setex', `batch:results:${batchId}:${i}`, 86400, JSON.stringify(results[i]));
 
       // Wait before sending next message (except for the last one)
       if (i < contacts.length - 1) {
@@ -1156,7 +1210,7 @@ async function processBulkMessages(client, sessionCode, contacts, message, inter
       });
       
       // Store failed attempt
-      await redis.setex(`batch:results:${batchId}:${i}`, 86400, JSON.stringify(results[i]));
+      await redisCommand('setex', `batch:results:${batchId}:${i}`, 86400, JSON.stringify(results[i]));
     }
   }
 
@@ -1171,7 +1225,7 @@ async function processBulkMessages(client, sessionCode, contacts, message, inter
   const totalDuration = Date.now() - startTime;
   
   // Store final results
-  await redis.hset(`batch:${batchId}`, {
+  await redisCommand('hset', `batch:${batchId}`, {
     completed: true,
     successCount,
     failedCount,
@@ -1181,7 +1235,7 @@ async function processBulkMessages(client, sessionCode, contacts, message, inter
   });
 
   // Store aggregated results (expire after 24 hours)
-  await redis.setex(`batch:results:${batchId}`, 86400, JSON.stringify(results));
+  await redisCommand('setex', `batch:results:${batchId}`, 86400, JSON.stringify(results));
 }
 
 // Enhanced batch status endpoint
@@ -1190,7 +1244,7 @@ app.get('/batch-status/:batchId', verifyAuth, async (req, res) => {
   const userId = req.user.id;
   
   try {
-    const batchData = await redis.hgetall(`batch:${batchId}`);
+    const batchData = await redisCommand('hgetall', `batch:${batchId}`);
     if (!batchData || Object.keys(batchData).length === 0) {
       return res.status(404).json({ 
         success: false, 
@@ -1242,7 +1296,7 @@ app.get('/batch-results/:batchId', verifyAuth, async (req, res) => {
   
   try {
     // Verify batch ownership
-    const batchOwner = await redis.hget(`batch:${batchId}`, 'userId');
+    const batchOwner = await redisCommand('hget', `batch:${batchId}`, 'userId');
     if (batchOwner !== userId) {
       return res.status(403).json({ 
         success: false, 
@@ -1251,11 +1305,11 @@ app.get('/batch-results/:batchId', verifyAuth, async (req, res) => {
     }
 
     // Try to get aggregated results first
-    let results = await redis.get(`batch:results:${batchId}`);
+    let results = await redisCommand('get', `batch:results:${batchId}`);
     
     if (!results) {
       // Fallback to building results from individual items
-      const batchData = await redis.hgetall(`batch:${batchId}`);
+      const batchData = await redisCommand('hgetall', `batch:${batchId}`);
       const total = parseInt(batchData.total || '0');
       
       const resultKeys = [];
@@ -1263,7 +1317,7 @@ app.get('/batch-results/:batchId', verifyAuth, async (req, res) => {
         resultKeys.push(`batch:results:${batchId}:${i}`);
       }
       
-      const individualResults = await redis.mget(resultKeys);
+      const individualResults = await redisCommand('mget', ...resultKeys);
       results = JSON.stringify(individualResults.map(r => JSON.parse(r || '{}')));
     }
 
@@ -1297,7 +1351,7 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
     }
 
     await sessionManager.removeClient(sessionCode);
-    await redis.del(`qr:${sessionCode}`);
+    await redisCommand('del', `qr:${sessionCode}`);
     
     // Update session status in database
     await updateSessionInDB(sessionCode, { 
@@ -1318,7 +1372,7 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
     
     // Force cleanup
     await sessionManager.removeClient(sessionCode);
-    await redis.del(`qr:${sessionCode}`);
+    await redisCommand('del', `qr:${sessionCode}`);
     await updateSessionInDB(sessionCode, { 
       status: 'disconnected',
       qr_code: null,
