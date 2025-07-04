@@ -15,18 +15,17 @@ const Redis = require('ioredis');
 const cluster = require('cluster');
 const os = require('os');
 const winston = require('winston');
-const { LoggingWinston } = require('@google-cloud/logging-winston');
 const { v4: uuidv4 } = require('uuid');
 const morgan = require('morgan');
 
 // Initialize logging
-const loggingWinston = new LoggingWinston();
 const logger = winston.createLogger({
   level: 'info',
-  transports: [
-    new winston.transports.Console(),
-    ...(process.env.NODE_ENV === 'production' ? [loggingWinston] : [])
-  ]
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [new winston.transports.Console()]
 });
 
 // Cluster mode for multi-core processing
