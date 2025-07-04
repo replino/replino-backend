@@ -22,6 +22,7 @@
   "dependencies": {
     "@bull-board/api": "^6.11.0",
     "@bull-board/express": "^6.11.0",
+    "@google-cloud/logging-winston": "^6.0.1",
     "@supabase/supabase-js": "^2.50.3",
     "bull": "^4.16.5",
     "cluster": "^0.7.7",
@@ -30,6 +31,7 @@
     "dotenv": "^17.0.1",
     "express": "^4.21.2",
     "express-rate-limit": "^7.5.1",
+    "express-rate-limit-redis": "^0.0.4",
     "fs": "^0.0.1-security",
     "helmet": "^7.2.0",
     "ioredis": "^5.6.1",
@@ -47,7 +49,8 @@
     "rate-limit-redis": "^4.2.1",
     "redis": "^4.6.7",
     "uuid": "^11.1.0",
-    "whatsapp-web.js": "^1.31.0"
+    "whatsapp-web.js": "^1.31.0",
+    "winston": "^3.17.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
