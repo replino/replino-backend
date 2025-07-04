@@ -6,7 +6,7 @@ const qrcode = require('qrcode');
 const fs = require('fs').promises;
 const path = require('path');
 const rateLimit = require('express-rate-limit');
-const { rateLimit: redisRateLimit } = require('express-rate-limit-redis');
+const RedisStore = require('rate-limit-redis');
 const helmet = require('helmet');
 const compression = require('compression');
 const { createClient } = require('@supabase/supabase-js');
@@ -148,58 +148,56 @@ if (cluster.isMaster && process.env.NODE_ENV === 'production') {
   }));
 
   // Enhanced rate limiting using Redis for distributed environments
-  const globalRateLimiter = rateLimit({
-    store: new redisRateLimit({
-      client: redis,
-      prefix: 'rl_global:'
-    }),
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 1000, // Limit each IP to 1000 requests per windowMs
-    message: 'Too many requests from this IP, please try again later.',
-    standardHeaders: true,
-    legacyHeaders: false,
-    keyGenerator: (req) => {
-      // Use the client's real IP address (considering proxy headers)
-      const forwarded = req.headers['x-forwarded-for'];
-      const ip = forwarded ? forwarded.split(',')[0] : req.ip;
-      return ip;
-    },
-    handler: (req, res) => {
-      logger.warn(`Rate limit exceeded for IP ${req.ip}`);
-      res.status(429).json({
-        success: false,
-        error: 'Too many requests, please try again later.',
-        requestId: req.id
-      });
-    }
-  });
+  // Global rate limiter
+const globalRateLimiter = rateLimit({
+  store: new RedisStore({
+    client: redis,
+    prefix: 'rl_global:'
+  }),
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 1000,
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const forwarded = req.headers['x-forwarded-for'];
+    const ip = forwarded ? forwarded.split(',')[0] : req.ip;
+    return ip;
+  },
+  handler: (req, res) => {
+    logger.warn(`Rate limit exceeded for IP ${req.ip}`);
+    res.status(429).json({
+      success: false,
+      error: 'Too many requests, please try again later.',
+      requestId: req.id
+    });
+  }
+});
 
   app.use(globalRateLimiter);
 
   // Stricter rate limiting for message sending
-  const sendLimiter = rateLimit({
-    store: new redisRateLimit({
-      client: redis,
-      prefix: 'rl_send:'
-    }),
-    windowMs: 60 * 1000, // 1 minute
-    max: 60, // Limit each user to 60 messages per minute
-    message: 'Too many messages sent, please slow down.',
-    standardHeaders: true,
-    legacyHeaders: false,
-    keyGenerator: (req) => {
-      // Rate limit by user ID from auth token
-      return req.user?.id || 'unknown';
-    },
-    handler: (req, res) => {
-      logger.warn(`Send rate limit exceeded for user ${req.user?.id || 'unknown'}`);
-      res.status(429).json({
-        success: false,
-        error: 'Too many messages sent, please slow down.',
-        requestId: req.id
-      });
-    }
-  });
+// Send message rate limiter
+const sendLimiter = rateLimit({
+  store: new RedisStore({
+    client: redis,
+    prefix: 'rl_send:'
+  }),
+  windowMs: 60 * 1000, // 1 minute
+  max: 60,
+  message: 'Too many messages sent, please slow down.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.id || 'unknown',
+  handler: (req, res) => {
+    logger.warn(`Send rate limit exceeded for user ${req.user?.id || 'unknown'}`);
+    res.status(429).json({
+      success: false,
+      error: 'Too many messages sent, please slow down.',
+      requestId: req.id
+    });
+  }
+});
 
   // Body parser with strict limits
   app.use(express.json({
