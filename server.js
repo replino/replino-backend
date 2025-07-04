@@ -15,7 +15,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Configure Express to trust proxies
-app.set('trust proxy', process.env.NODE_ENV === 'production' ? true : false);
+app.set('trust proxy', process.env.NODE_ENV === 'production' ? 1 : 0);
 
 // Initialize Redis client for Upstash
 const redis = new Redis({
