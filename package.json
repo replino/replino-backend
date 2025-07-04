@@ -20,7 +20,10 @@
   "author": "WhatsApp Bulk Sender",
   "license": "MIT",
   "dependencies": {
-    "@supabase/supabase-js": "^2.50.2",
+    "@bull-board/api": "^6.11.0",
+    "@bull-board/express": "^6.11.0",
+    "@supabase/supabase-js": "^2.50.3",
+    "bull": "^4.16.5",
     "cluster": "^0.7.7",
     "compression": "^1.8.0",
     "cors": "^2.8.5",
