@@ -59,14 +59,20 @@ class RedisConnection {
         const delay = Math.min(times * 100, 5000); // Max 5 second delay
         return delay;
       },
-      maxRetriesPerRequest: 1, // Reduced from 3 to fail faster
+      maxRetriesPerRequest: null, // Set to null to disable retry limit
       enableOfflineQueue: false, // Disable offline queue to prevent request buildup
       reconnectOnError: (err) => {
         // Only reconnect on these specific errors
-        const targetErrors = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED'];
-        return targetErrors.includes(err.code);
+        const targetErrors = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'NR_CLOSED'];
+        if (targetErrors.includes(err.code)) {
+          return true;
+        }
+        return false;
       },
-      showFriendlyErrorStack: true
+      showFriendlyErrorStack: true,
+      connectTimeout: 10000, // 10 second connection timeout
+      commandTimeout: 5000, // 5 second command timeout
+      keepAlive: 10000 // 10 second keepalive
     });
 
     this.client.on('connect', () => {
@@ -95,7 +101,9 @@ class RedisConnection {
   }
 
   async get(key) {
-    if (!this.isConnected) throw new Error('Redis not connected');
+    if (!this.isConnected) {
+      throw new Error('Redis not connected');
+    }
     try {
       return await this.client.get(key);
     } catch (err) {
@@ -105,7 +113,9 @@ class RedisConnection {
   }
 
   async setex(key, ttl, value) {
-    if (!this.isConnected) throw new Error('Redis not connected');
+    if (!this.isConnected) {
+      throw new Error('Redis not connected');
+    }
     try {
       return await this.client.setex(key, ttl, value);
     } catch (err) {
@@ -115,7 +125,9 @@ class RedisConnection {
   }
 
   async del(key) {
-    if (!this.isConnected) throw new Error('Redis not connected');
+    if (!this.isConnected) {
+      throw new Error('Redis not connected');
+    }
     try {
       return await this.client.del(key);
     } catch (err) {
