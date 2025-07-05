@@ -41,32 +41,100 @@ const PORT = process.env.PORT || 3001;
 // Configure Express to trust proxies
 app.set('trust proxy', process.env.NODE_ENV === 'production' ? 2 : 0);
 
-// Initialize Redis client with connection pooling
-const redis = new Redis({
-  host: process.env.REDIS_HOST || 'clean-panda-53790.upstash.io',
-  port: process.env.REDIS_PORT || 6379,
-  password: process.env.REDIS_PASSWORD || 'AdIeAAIjcDE3ZDhjZTNlYTRmYWY0YTMxODNhZDc1MDVmZGQwNWVhOXAxMA',
-  tls: process.env.REDIS_TLS === 'true' ? {} : undefined,
-  retryStrategy: (times) => {
-    const delay = Math.min(times * 50, 2000);
-    return delay;
-  },
-  maxRetriesPerRequest: 3,
-  enableOfflineQueue: true
-});
-
-// Redis error handling
-redis.on('error', (err) => {
-  if (err.code === 'ECONNREFUSED') {
-    console.error('❌ Redis connection refused. Please check Redis configuration.');
-  } else {
-    console.error('Redis error:', err);
+// Enhanced Redis connection with robust error handling and reconnection
+class RedisConnection {
+  constructor() {
+    this.client = null;
+    this.isConnected = false;
+    this.initialize();
   }
-});
 
-redis.on('ready', () => {
-  console.log(`🔴 Redis connected successfully (Worker ${process.pid})`);
-});
+  initialize() {
+    this.client = new Redis({
+      host: process.env.REDIS_HOST || 'clean-panda-53790.upstash.io',
+      port: process.env.REDIS_PORT || 6379,
+      password: process.env.REDIS_PASSWORD || 'AdIeAAIjcDE3ZDhjZTNlYTRmYWY0YTMxODNhZDc1MDVmZGQwNWVhOXAxMA',
+      tls: process.env.REDIS_TLS === 'true' ? {} : undefined,
+      retryStrategy: (times) => {
+        const delay = Math.min(times * 100, 5000); // Max 5 second delay
+        return delay;
+      },
+      maxRetriesPerRequest: 1, // Reduced from 3 to fail faster
+      enableOfflineQueue: false, // Disable offline queue to prevent request buildup
+      reconnectOnError: (err) => {
+        // Only reconnect on these specific errors
+        const targetErrors = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED'];
+        return targetErrors.includes(err.code);
+      },
+      showFriendlyErrorStack: true
+    });
+
+    this.client.on('connect', () => {
+      console.log('Redis connection established');
+      this.isConnected = true;
+    });
+
+    this.client.on('ready', () => {
+      console.log('Redis client ready');
+      this.isConnected = true;
+    });
+
+    this.client.on('error', (err) => {
+      console.error('Redis error:', err.message);
+      this.isConnected = false;
+    });
+
+    this.client.on('end', () => {
+      console.log('Redis connection closed');
+      this.isConnected = false;
+    });
+
+    this.client.on('reconnecting', (delay) => {
+      console.log(`Attempting to reconnect to Redis in ${delay}ms`);
+    });
+  }
+
+  async get(key) {
+    if (!this.isConnected) throw new Error('Redis not connected');
+    try {
+      return await this.client.get(key);
+    } catch (err) {
+      console.error('Redis get error:', err.message);
+      throw err;
+    }
+  }
+
+  async setex(key, ttl, value) {
+    if (!this.isConnected) throw new Error('Redis not connected');
+    try {
+      return await this.client.setex(key, ttl, value);
+    } catch (err) {
+      console.error('Redis setex error:', err.message);
+      throw err;
+    }
+  }
+
+  async del(key) {
+    if (!this.isConnected) throw new Error('Redis not connected');
+    try {
+      return await this.client.del(key);
+    } catch (err) {
+      console.error('Redis del error:', err.message);
+      throw err;
+    }
+  }
+
+  async quit() {
+    try {
+      await this.client.quit();
+    } catch (err) {
+      console.error('Redis quit error:', err.message);
+    }
+  }
+}
+
+// Initialize Redis connection
+const redis = new RedisConnection();
 
 // Initialize Supabase client with connection pooling
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -240,10 +308,14 @@ async function verifyAuth(req, res, next) {
 
   try {
     // Check cache first
-    const cachedUser = await redis.get(cacheKey);
-    if (cachedUser) {
-      req.user = JSON.parse(cachedUser);
-      return next();
+    try {
+      const cachedUser = await redis.get(cacheKey);
+      if (cachedUser) {
+        req.user = JSON.parse(cachedUser);
+        return next();
+      }
+    } catch (redisError) {
+      console.error('Redis cache check failed, proceeding without cache:', redisError.message);
     }
 
     // Verify token with Supabase
@@ -257,7 +329,12 @@ async function verifyAuth(req, res, next) {
     }
 
     // Cache the user for 5 minutes
-    await redis.setex(cacheKey, 300, JSON.stringify(user));
+    try {
+      await redis.setex(cacheKey, 300, JSON.stringify(user));
+    } catch (redisError) {
+      console.error('Failed to cache user in Redis:', redisError.message);
+    }
+    
     req.user = user;
     next();
   } catch (error) {
@@ -308,8 +385,12 @@ async function getSessionFromDB(sessionCode, userId = null) {
   
   try {
     // Check cache first
-    const cachedSession = await redis.get(cacheKey);
-    if (cachedSession) return JSON.parse(cachedSession);
+    try {
+      const cachedSession = await redis.get(cacheKey);
+      if (cachedSession) return JSON.parse(cachedSession);
+    } catch (redisError) {
+      console.error('Redis cache check failed, proceeding without cache:', redisError.message);
+    }
     
     let query = supabase
       .from('sessions')
@@ -325,7 +406,12 @@ async function getSessionFromDB(sessionCode, userId = null) {
     if (error || !data) return null;
     
     // Cache the session for 1 minute
-    await redis.setex(cacheKey, 60, JSON.stringify(data));
+    try {
+      await redis.setex(cacheKey, 60, JSON.stringify(data));
+    } catch (redisError) {
+      console.error('Failed to cache session in Redis:', redisError.message);
+    }
+    
     return data;
   } catch (error) {
     console.error('Database fetch error:', error);
@@ -381,11 +467,18 @@ const generateQRCode = throttle(async (qrData) => {
 // Health check endpoint with system diagnostics
 app.get('/health', async (req, res) => {
   try {
-    const [redisPing, supabasePing, memoryUsage] = await Promise.all([
-      redis.ping().catch(() => 'failed'),
+    const [redisStatus, supabaseStatus, memoryUsage] = await Promise.all([
+      (async () => {
+        try {
+          await redis.get('healthcheck');
+          return 'connected';
+        } catch {
+          return 'disconnected';
+        }
+      })(),
       supabase.from('sessions').select('*', { count: 'exact', head: true }).limit(1)
-        .then(() => 'ok')
-        .catch(() => 'failed'),
+        .then(() => 'connected')
+        .catch(() => 'disconnected'),
       process.memoryUsage()
     ]);
     
@@ -401,8 +494,8 @@ app.get('/health', async (req, res) => {
         heapUsed: memoryUsage.heapUsed / 1024 / 1024,
         external: memoryUsage.external / 1024 / 1024
       },
-      redis: redisPing === 'PONG' ? 'connected' : 'disconnected',
-      supabase: supabasePing === 'ok' ? 'connected' : 'disconnected',
+      redis: redisStatus,
+      supabase: supabaseStatus,
       load: os.loadavg()
     });
   } catch (error) {
@@ -418,36 +511,29 @@ app.get('/stats', verifyAuth, async (req, res) => {
   try {
     const [
       userSessionsCount,
-      systemStats,
-      redisStats
+      memoryUsage
     ] = await Promise.all([
       supabase
         .from('sessions')
         .select('*', { count: 'exact', head: true })
         .eq('user_id', req.user.id),
-      redis.info(),
-      (async () => ({
-        memoryUsage: process.memoryUsage(),
-        cpuUsage: process.cpuUsage(),
-        load: os.loadavg()
-      }))()
+      process.memoryUsage()
     ]);
 
     const stats = {
       activeSessions: clients.size,
       userSessions: userSessionsCount.count || 0,
       uptime: process.uptime(),
-      memory: systemStats.memoryUsage,
-      cpu: systemStats.cpuUsage,
-      load: systemStats.load,
-      timestamp: new Date().toISOString(),
-      redis: {
-        status: redis.status,
-        version: redisStats.includes('redis_version:') ? 
-          redisStats.split('redis_version:')[1].split('\r')[0] : 'unknown',
-        memory: redisStats.includes('used_memory_human:') ?
-          redisStats.split('used_memory_human:')[1].split('\r')[0] : 'unknown'
+      memory: {
+        rss: memoryUsage.rss / 1024 / 1024,
+        heapTotal: memoryUsage.heapTotal / 1024 / 1024,
+        heapUsed: memoryUsage.heapUsed / 1024 / 1024,
+        external: memoryUsage.external / 1024 / 1024
       },
+      cpu: process.cpuUsage(),
+      load: os.loadavg(),
+      timestamp: new Date().toISOString(),
+      redis: redis.isConnected ? 'connected' : 'disconnected',
       worker: process.pid
     };
     
@@ -511,7 +597,9 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
           await client.destroy();
         } catch (e) {}
         clients.delete(sessionCode);
-        await redis.del(`qr:${sessionCode}`);
+        try {
+          await redis.del(`qr:${sessionCode}`);
+        } catch (e) {}
       }
     }
 
@@ -569,7 +657,11 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
         const qrCodeImage = await generateQRCode(qr);
 
         // Store in Redis cache for faster access
-        await redis.setex(`qr:${sessionCode}`, 300, qrCodeImage);
+        try {
+          await redis.setex(`qr:${sessionCode}`, 300, qrCodeImage);
+        } catch (redisError) {
+          console.error(`[${sessionCode}] Failed to cache QR code:`, redisError.message);
+        }
 
         // Update session with QR code in database
         await updateSessionInDB(sessionCode, { 
@@ -587,7 +679,9 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
       console.log(`[${sessionCode}] Loading: ${percent}% ${message || ''}`);
       if (percent === 100) {
         // QR code has been scanned - clear it
-        await redis.del(`qr:${sessionCode}`);
+        try {
+          await redis.del(`qr:${sessionCode}`);
+        } catch (e) {}
         await updateSessionInDB(sessionCode, {
           qr_code: null,
           status: 'connecting'
@@ -597,7 +691,9 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('authenticated', async () => {
       console.log(`[${sessionCode}] Authenticated`);
-      await redis.del(`qr:${sessionCode}`);
+      try {
+        await redis.del(`qr:${sessionCode}`);
+      } catch (e) {}
       
       await updateSessionInDB(sessionCode, { 
         status: 'connected',
@@ -611,7 +707,9 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('auth_failure', async (msg) => {
       console.error(`[${sessionCode}] Authentication failed:`, msg);
-      await redis.del(`qr:${sessionCode}`);
+      try {
+        await redis.del(`qr:${sessionCode}`);
+      } catch (e) {}
       
       await updateSessionInDB(sessionCode, { 
         status: 'expired',
@@ -623,7 +721,9 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('ready', async () => {
       console.log(`[${sessionCode}] Client ready`);
-      await redis.del(`qr:${sessionCode}`);
+      try {
+        await redis.del(`qr:${sessionCode}`);
+      } catch (e) {}
       
       await updateSessionInDB(sessionCode, { 
         status: 'connected',
@@ -637,7 +737,9 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
     client.on('disconnected', async (reason) => {
       console.log(`[${sessionCode}] Disconnected:`, reason);
-      await redis.del(`qr:${sessionCode}`);
+      try {
+        await redis.del(`qr:${sessionCode}`);
+      } catch (e) {}
       
       await updateSessionInDB(sessionCode, { 
         status: 'disconnected',
@@ -656,7 +758,9 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
         await client.destroy();
       } catch (e) {}
       clients.delete(sessionCode);
-      await redis.del(`qr:${sessionCode}`);
+      try {
+        await redis.del(`qr:${sessionCode}`);
+      } catch (e) {}
       
       await updateSessionInDB(sessionCode, { 
         status: 'failed',
@@ -682,7 +786,9 @@ app.post('/init/:sessionCode', verifyAuth, async (req, res) => {
 
   } catch (error) {
     console.error(`[${requestId}] Initialization error:`, error);
-    await redis.del(`qr:${sessionCode}`);
+    try {
+      await redis.del(`qr:${sessionCode}`);
+    } catch (e) {}
     
     await updateSessionInDB(sessionCode, { 
       status: 'failed',
@@ -714,13 +820,18 @@ app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
   
   try {
     // Check Redis cache first
-    const cachedQR = await redis.get(`qr:${sessionCode}`);
-    if (cachedQR) {
-      console.log(`[${requestId}] Returning cached QR code`);
-      return res.json({ 
-        success: true, 
-        qrCode: cachedQR
-      });
+    let cachedQR;
+    try {
+      cachedQR = await redis.get(`qr:${sessionCode}`);
+      if (cachedQR) {
+        console.log(`[${requestId}] Returning cached QR code`);
+        return res.json({ 
+          success: true, 
+          qrCode: cachedQR
+        });
+      }
+    } catch (redisError) {
+      console.error(`[${requestId}] Redis cache check failed:`, redisError.message);
     }
 
     // Verify session belongs to user and get QR code from database
@@ -742,7 +853,11 @@ app.get('/qrcode/:sessionCode', verifyAuth, async (req, res) => {
     }
 
     // Cache the QR code in Redis
-    await redis.setex(`qr:${sessionCode}`, 300, sessionData.qr_code);
+    try {
+      await redis.setex(`qr:${sessionCode}`, 300, sessionData.qr_code);
+    } catch (redisError) {
+      console.error(`[${requestId}] Failed to cache QR code:`, redisError.message);
+    }
     
     console.log(`[${requestId}] Returning QR code from DB`);
     res.json({ 
@@ -790,7 +905,9 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
         if (state === 'CONNECTED') {
           actualStatus = 'connected';
           // Ensure QR code is cleared when connected
-          await redis.del(`qr:${sessionCode}`);
+          try {
+            await redis.del(`qr:${sessionCode}`);
+          } catch (e) {}
           qrCode = null;
           
           // Update last active time
@@ -801,8 +918,12 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
           qrCode = null;
         } else {
           // Check if we should show QR code
-          const cachedQR = await redis.get(`qr:${sessionCode}`);
-          qrCode = cachedQR || sessionData.qr_code;
+          try {
+            const cachedQR = await redis.get(`qr:${sessionCode}`);
+            qrCode = cachedQR || sessionData.qr_code;
+          } catch (e) {
+            qrCode = sessionData.qr_code;
+          }
         }
         
         await updateSessionInDB(sessionCode, { 
@@ -820,7 +941,9 @@ app.get('/status/:sessionCode', verifyAuth, async (req, res) => {
           await client.destroy();
         } catch (e) {}
         clients.delete(sessionCode);
-        await redis.del(`qr:${sessionCode}`);
+        try {
+          await redis.del(`qr:${sessionCode}`);
+        } catch (e) {}
       }
     }
     
@@ -1156,7 +1279,9 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
         } catch (e) {}
       }
       clients.delete(sessionCode);
-      await redis.del(`qr:${sessionCode}`);
+      try {
+        await redis.del(`qr:${sessionCode}`);
+      } catch (e) {}
     }
     
     // Update session status in database
@@ -1176,7 +1301,9 @@ app.post('/disconnect/:sessionCode', verifyAuth, async (req, res) => {
     
     // Force cleanup
     clients.delete(sessionCode);
-    await redis.del(`qr:${sessionCode}`);
+    try {
+      await redis.del(`qr:${sessionCode}`);
+    } catch (e) {}
     await updateSessionInDB(sessionCode, { 
       status: 'disconnected',
       qr_code: null 
@@ -1201,14 +1328,18 @@ app.get('/sessions', verifyAuth, async (req, res) => {
     const cacheKey = `user_sessions:${userId}`;
     
     // Check cache first
-    const cachedSessions = await redis.get(cacheKey);
-    if (cachedSessions) {
-      console.log(`[${requestId}] Returning cached sessions`);
-      return res.json({ 
-        success: true, 
-        sessions: JSON.parse(cachedSessions),
-        cached: true
-      });
+    try {
+      const cachedSessions = await redis.get(cacheKey);
+      if (cachedSessions) {
+        console.log(`[${requestId}] Returning cached sessions`);
+        return res.json({ 
+          success: true, 
+          sessions: JSON.parse(cachedSessions),
+          cached: true
+        });
+      }
+    } catch (redisError) {
+      console.error(`[${requestId}] Redis cache check failed:`, redisError.message);
     }
 
     const { data: sessions, error } = await supabase
@@ -1228,7 +1359,11 @@ app.get('/sessions', verifyAuth, async (req, res) => {
     }));
     
     // Cache the sessions for 1 minute
-    await redis.setex(cacheKey, 60, JSON.stringify(sessionsWithStatus));
+    try {
+      await redis.setex(cacheKey, 60, JSON.stringify(sessionsWithStatus));
+    } catch (redisError) {
+      console.error(`[${requestId}] Failed to cache sessions:`, redisError.message);
+    }
     
     console.log(`[${requestId}] Returning ${sessions.length} sessions`);
     res.json({ 
@@ -1263,9 +1398,13 @@ app.post('/validate-phone', async (req, res) => {
   
   try {
     // Check cache first
-    const cachedValidation = await redis.get(cacheKey);
-    if (cachedValidation) {
-      return res.json(JSON.parse(cachedValidation));
+    try {
+      const cachedValidation = await redis.get(cacheKey);
+      if (cachedValidation) {
+        return res.json(JSON.parse(cachedValidation));
+      }
+    } catch (redisError) {
+      console.error('Redis cache check failed:', redisError.message);
     }
 
     const isValid = validatePhoneNumber(phone);
@@ -1279,7 +1418,11 @@ app.post('/validate-phone', async (req, res) => {
     };
 
     // Cache the result for 1 hour
-    await redis.setex(cacheKey, 3600, JSON.stringify(result));
+    try {
+      await redis.setex(cacheKey, 3600, JSON.stringify(result));
+    } catch (redisError) {
+      console.error('Failed to cache phone validation:', redisError.message);
+    }
     
     res.json(result);
   } catch (error) {
@@ -1325,7 +1468,9 @@ async function gracefulShutdown(signal) {
         try {
           console.log(`Disconnecting session ${sessionCode}...`);
           await client.destroy();
-          await redis.del(`qr:${sessionCode}`);
+          try {
+            await redis.del(`qr:${sessionCode}`);
+          } catch (e) {}
           await updateSessionInDB(sessionCode, { 
             status: 'disconnected',
             qr_code: null 
